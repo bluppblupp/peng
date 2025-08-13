@@ -27,7 +27,7 @@ Deno.serve(async (req) => {
       const tokenResponse = await fetch(`${GOCARDLESS_BASE_URL}/token/new/`, {
         method: 'POST',
         headers: {
-          'Content-Type': 'application/json',
+          'Content-Type': 'application/json', 
           'Accept': 'application/json'
         },
         body: JSON.stringify({
@@ -78,32 +78,73 @@ Deno.serve(async (req) => {
       }
 
       case 'createRequisition': {
-        const { institutionId, redirectUrl } = params
-        const response = await fetch(`${GOCARDLESS_BASE_URL}/requisitions/`, {
-          method: 'POST',
-          headers,
-          body: JSON.stringify({
-            institution_id: institutionId,
-            redirect: redirectUrl || window.location.origin,
-            reference: `req_${Date.now()}`,
-          })
-        })
-        const data = await response.json()
-        return new Response(JSON.stringify(data), {
-          headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-        })
-      }
+  const { institutionId, redirectUrl } = params
+  if (!institutionId) {
+    return new Response(JSON.stringify({ error: 'institutionId is required' }), {
+      status: 400,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    })
+  }
+  if (!redirectUrl) {
+    return new Response(JSON.stringify({ error: 'redirectUrl is required' }), {
+      status: 400,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    })
+  }
+
+  const response = await fetch(`${GOCARDLESS_BASE_URL}/requisitions/`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      institution_id: institutionId,
+      redirect: redirectUrl,          // ✅ do not use window.location in Deno
+      reference: `req_${Date.now()}`,
+    })
+  })
+
+  if (!response.ok) {
+    const text = await response.text()
+    console.error('Requisition create failed:', response.status, text)
+    return new Response(JSON.stringify({ error: `HTTP ${response.status}: ${text}` }), {
+      status: response.status,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    })
+  }
+
+  const data = await response.json()
+  // data.link is the bank-auth URL you must send the user to
+  return new Response(JSON.stringify({
+    id: data.id,
+    link: data.link,                  // ✅ bank-auth URL
+    redirect: data.redirect,          // your return URL (FYI, not for navigation now)
+    status: data.status
+  }), {
+    headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+  })
+}
 
       case 'getRequisition': {
-        const { requisitionId } = params
-        const response = await fetch(`${GOCARDLESS_BASE_URL}/requisitions/${requisitionId}/`, {
-          headers
-        })
-        const data = await response.json()
-        return new Response(JSON.stringify(data), {
-          headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-        })
-      }
+  const { requisitionId } = params
+  const response = await fetch(`${GOCARDLESS_BASE_URL}/requisitions/${requisitionId}/`, { headers })
+  if (!response.ok) {
+    const text = await response.text()
+    return new Response(JSON.stringify({ error: `HTTP ${response.status}: ${text}` }), {
+      status: response.status,
+      headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+    })
+  }
+  const data = await response.json()
+  return new Response(JSON.stringify({
+    id: data.id,
+    institution_id: data.institution_id || data.institution?.id,
+    accounts: data.accounts || [],
+    redirect: data.redirect,
+    status: data.status
+  }), {
+    headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+  })
+}
+
 
       case 'getAccountDetails': {
         const { accountId } = params

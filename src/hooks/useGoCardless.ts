@@ -61,12 +61,15 @@ export const useGoCardless = () => {
     return Array.isArray(data) ? data : [];
   }, [callGoCardlessAPI]);
 
-  const createBankConnection = useCallback(async (institutionId: string) => {
-    return await callGoCardlessAPI("createRequisition", {
-      institutionId,
-      redirectUrl: window.location.origin,
-    });
-  }, [callGoCardlessAPI]);
+  const createBankConnection = useCallback(
+    async (institutionId: string, redirectUrl: string) => {
+      return await callGoCardlessAPI('createRequisition', {
+        institutionId,
+        redirectUrl, // pass through from the caller
+      })
+    },
+    [callGoCardlessAPI]
+  )
 
   const getRequisitionStatus = useCallback(async (requisitionId: string) => {
     return await callGoCardlessAPI("getRequisition", { requisitionId });
@@ -107,16 +110,21 @@ export const useGoCardless = () => {
     [callGoCardlessAPI]
   );
 
-  /** 🔹 New helper: Connect a bank and return { accountId, institutionName } */
-  const connectBank = useCallback(async () => {
-    const banks = await getBanks("GB");
-    if (!banks.length) throw new Error("No banks found");
+const connectBank = useCallback(async () => {
+  const banks = await getBanks("GB");
+  if (!banks.length) throw new Error("No banks found");
 
-    const selectedBank = banks[0]; // For demo — should be selectable in UI
-    const requisition = await createBankConnection(selectedBank.id);
+  const selectedBank = banks[0]; // (still just a demo pick)
+  const redirectUrl = `${window.location.origin}${window.location.pathname}`;
 
-    return { accountId: requisition.accountId, institutionName: selectedBank.name };
-  }, [getBanks, createBankConnection]);
+  // now pass both params
+  const res: any = await createBankConnection(selectedBank.id, redirectUrl);
+
+  // FYI: your edge function returns { id, link, redirect, status }
+  // It does NOT return accountId here — that comes AFTER the user completes the flow.
+  // So just return what you actually have:
+  return { requisitionId: res.id, link: res.link, institutionName: selectedBank.name };
+}, [getBanks, createBankConnection]);
 
   return {
     loading,
