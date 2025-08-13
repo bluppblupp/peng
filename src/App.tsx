@@ -9,6 +9,9 @@ import Dashboard from "./pages/Dashboard";
 import Settings from "./pages/Settings";
 import Budget from "./pages/Budget";
 import NotFound from "./pages/NotFound";
+import { BankConnection } from '@/components/bank/BankConnection';
+import { BankCallbackPage } from '@/components/bank/BankCallbackPage';
+import { TransactionList } from '@/components/bank/TransactionList';
 
 const queryClient = new QueryClient();
 
@@ -24,6 +27,9 @@ const App = () => (
             <Route path="/dashboard" element={<Dashboard />} />
             <Route path="/budget" element={<Budget />} />
             <Route path="/settings" element={<Settings />} />
+            <Route path="/connect-bank" element={<BankConnection />} />
+            <Route path="/banks/callback" element={<BankCallbackPage />} />
+            <Route path="/transactions" element={<TransactionList />} />
             {/* ADD ALL CUSTOM ROUTES ABOVE THE CATCH-ALL "*" ROUTE */}
             <Route path="*" element={<NotFound />} />
           </Routes>

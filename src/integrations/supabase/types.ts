@@ -38,6 +38,54 @@ export type Database = {
         }
         Relationships: []
       }
+       bank_accounts: {
+        Row: {
+          account_id: string
+          connected_bank_id: string
+          created_at: string
+          currency: string | null
+          id: string
+          institution_id: string
+          is_selected: boolean
+          iban: string | null
+          last_synced_at: string | null
+          name: string | null
+          provider: string
+          type: string | null
+          user_id: string
+        }
+        Insert: {
+          account_id: string
+          connected_bank_id: string
+          created_at?: string
+          currency?: string | null
+          id?: string
+          institution_id: string
+          is_selected?: boolean
+          iban?: string | null
+          last_synced_at?: string | null
+          name?: string | null
+          provider?: string
+          type?: string | null
+          user_id: string
+        }
+        Update: {
+          account_id?: string
+          connected_bank_id?: string
+          created_at?: string
+          currency?: string | null
+          id?: string
+          institution_id?: string
+          is_selected?: boolean
+          iban?: string | null
+          last_synced_at?: string | null
+          name?: string | null
+          provider?: string
+          type?: string | null
+          user_id?: string
+        }
+        Relationships: []
+      }
       budgets: {
         Row: {
           category: string
@@ -67,30 +115,45 @@ export type Database = {
       }
       connected_banks: {
         Row: {
-          account_id: string
+          account_id: string | null
           bank_name: string
           connected_at: string
+          consent_expires_at: string | null
+          country: string | null
           id: string
           institution_id: string
           is_active: boolean
+          link_id: string | null
+          provider: string
+          status: string
           user_id: string
         }
         Insert: {
-          account_id: string
+          account_id?: string | null
           bank_name: string
           connected_at?: string
+          consent_expires_at?: string | null
+          country?: string | null
           id?: string
           institution_id: string
           is_active?: boolean
+          link_id?: string | null
+          provider?: string
+          status?: string
           user_id: string
         }
         Update: {
-          account_id?: string
+          account_id?: string | null
           bank_name?: string
           connected_at?: string
+          consent_expires_at?: string | null
+          country?: string | null
           id?: string
           institution_id?: string
           is_active?: boolean
+          link_id?: string | null
+          provider?: string
+          status?: string
           user_id?: string
         }
         Relationships: []
