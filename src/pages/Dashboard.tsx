@@ -6,6 +6,7 @@ import { TransactionList } from '@/components/bank/TransactionList'
 import { CategoryChart } from '@/components/CategoryChart'
 import { useAuth } from '@/contexts/AuthContext'
 import { CurrencyProvider } from '@/contexts/CurrencyContext'
+import { BankConnection } from '@/components/bank/BankConnection'
 
 const Dashboard = () => {
   const { user, loading } = useAuth()
@@ -42,6 +43,7 @@ const Dashboard = () => {
 
           <BudgetOverview />
           <CategoryChart />
+          <BankConnection />
           <TransactionList />
         </main>
       </div>

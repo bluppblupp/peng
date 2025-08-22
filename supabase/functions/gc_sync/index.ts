@@ -16,59 +16,107 @@ const SUPABASE_ANON_KEY = Deno.env.get("SUPABASE_ANON_KEY")!
 
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: allow(req) })
-  if (req.method !== "POST") return new Response("Method not allowed", { status: 405, headers: allow(req) })
+  if (req.method !== "POST") {
+    return new Response(JSON.stringify({ error: "Method not allowed" }), {
+      status: 405,
+      headers: { "content-type": "application/json", ...allow(req) },
+    })
+  }
 
   const supa = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
     global: { headers: { Authorization: req.headers.get("Authorization") ?? "" } },
   })
   const { data: { user } } = await supa.auth.getUser()
-  if (!user) return new Response("Unauthorized", { status: 401, headers: allow(req) })
+  if (!user) {
+    return new Response(JSON.stringify({ error: "Unauthorized" }), {
+      status: 401,
+      headers: { "content-type": "application/json", ...allow(req) },
+    })
+  }
 
-  const { bank_account_id, date_from } = await req.json()
+  try {
+    const { bank_account_id, date_from } = await req.json()
 
-  const { data: acct, error } = await supa.from("bank_accounts")
-    .select("id, account_id")
-    .eq("id", bank_account_id)
-    .eq("user_id", user.id)
-    .single()
-  if (error || !acct) return new Response("Not found", { status: 404, headers: allow(req) })
+    const { data: acct, error } = await supa.from("bank_accounts")
+      .select("id, account_id")
+      .eq("id", bank_account_id)
+      .eq("user_id", user.id)
+      .single()
+    if (error || !acct) {
+      return new Response(JSON.stringify({ error: "Not found" }), {
+        status: 404,
+        headers: { "content-type": "application/json", ...allow(req) },
+      })
+    }
 
-  const qs = new URLSearchParams()
-  if (date_from) qs.set("date_from", date_from) // YYYY-MM-DD
+    const qs = new URLSearchParams()
+    if (date_from) qs.set("date_from", date_from)
 
-  const txRes = await fetch(`${BASE}/accounts/${acct.account_id}/transactions/?${qs}`, {
-    headers: { Authorization: AUTH },
-  })
-  if (!txRes.ok) return new Response(await txRes.text(), { status: txRes.status, headers: allow(req) })
-  const txr = await txRes.json()
+    const txRes = await fetch(`${BASE}/accounts/${acct.account_id}/transactions/?${qs}`, {
+      headers: { Authorization: AUTH },
+    })
+    if (!txRes.ok) {
+      const text = await txRes.text()
+      return new Response(JSON.stringify({ error: text }), {
+        status: txRes.status,
+        headers: { "content-type": "application/json", ...allow(req) },
+      })
+    }
+    const txr = await txRes.json()
 
-  const booked = txr.transactions?.booked ?? []
-  const pending = txr.transactions?.pending ?? []
-  const all = [...booked, ...pending]
+    const booked = txr.transactions?.booked ?? []
+    const pending = txr.transactions?.pending ?? []
+    const all = [...booked, ...pending]
 
-  const rows = all.map((t: any) => {
-    const txid = t.internalTransactionId ?? t.transactionId ?? crypto.randomUUID()
-    const amount = String(t.transactionAmount?.amount ?? t.amount?.value ?? "0") // keep as string
-    const descr =
-      t.remittanceInformationUnstructured ??
-      t.additionalInformation ??
-      t.creditorName ??
-      t.debtorName ??
-      t.bankTransactionCode ??
-      "Transaction"
-    const date = t.bookingDate ?? t.valueDate ?? new Date().toISOString().slice(0, 10)
-    return { user_id: user.id, bank_account_id, transaction_id: txid, description: descr, amount, category: "Other", date }
-  })
+    type Tx = {
+      internalTransactionId?: string
+      transactionId?: string
+      transactionAmount?: { amount?: number }
+      amount?: { value?: number }
+      remittanceInformationUnstructured?: string
+      additionalInformation?: string
+      creditorName?: string
+      debtorName?: string
+      bankTransactionCode?: string
+      bookingDate?: string
+      valueDate?: string
+    }
 
-  const { error: insErr } = await supa.from("transactions").upsert(rows, {
-    onConflict: "user_id,bank_account_id,transaction_id",
-    ignoreDuplicates: true, // translates to ON CONFLICT DO NOTHING
-  })
-  if (insErr) return new Response(insErr.message, { status: 500, headers: allow(req) })
+    const rows = all.map((t: Tx) => {
+      const txid = t.internalTransactionId ?? t.transactionId ?? crypto.randomUUID()
+      const amount = String(t.transactionAmount?.amount ?? t.amount?.value ?? "0")
+      const descr =
+        t.remittanceInformationUnstructured ??
+        t.additionalInformation ??
+        t.creditorName ??
+        t.debtorName ??
+        t.bankTransactionCode ??
+        "Transaction"
+      const date = t.bookingDate ?? t.valueDate ?? new Date().toISOString().slice(0, 10)
+      return { user_id: user.id, bank_account_id, transaction_id: txid, description: descr, amount, category: "Other", date }
+    })
 
-  await supa.from("bank_accounts").update({ last_synced_at: new Date().toISOString() }).eq("id", bank_account_id)
+    const { error: insErr } = await supa.from("transactions").upsert(rows, {
+      onConflict: "user_id,bank_account_id,transaction_id",
+      ignoreDuplicates: true,
+    })
+    if (insErr) {
+      return new Response(JSON.stringify({ error: insErr.message }), {
+        status: 500,
+        headers: { "content-type": "application/json", ...allow(req) },
+      })
+    }
 
-  return new Response(JSON.stringify({ inserted: rows.length }), {
-    headers: { "content-type": "application/json", ...allow(req) },
-  })
+    await supa.from("bank_accounts").update({ last_synced_at: new Date().toISOString() }).eq("id", bank_account_id)
+
+    return new Response(JSON.stringify({ inserted: rows.length }), {
+      headers: { "content-type": "application/json", ...allow(req) },
+    })
+  } catch (err) {
+    console.error("gc_sync failed:", err)
+    return new Response(JSON.stringify({ error: String(err) }), {
+      status: 500,
+      headers: { "content-type": "application/json", ...allow(req) },
+    })
+  }
 })

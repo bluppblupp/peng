@@ -5,6 +5,11 @@ import { Loader2, Plus } from "lucide-react"
 import { useToast } from "@/hooks/use-toast"
 import { supabase } from "@/integrations/supabase/client"
 
+interface Institution {
+  id: string
+  name: string
+}
+
 const COUNTRIES = [
   { code: "SE", label: "Sweden" },
   { code: "NO", label: "Norway" },
@@ -23,25 +28,58 @@ const COUNTRIES = [
 export function BankConnection() {
   const { toast } = useToast()
   const [country, setCountry] = useState<string>("SE")
-  const [banks, setBanks] = useState<{ id: string; name: string }[]>([])
+  const [banks, setBanks] = useState<Institution[]>([])
   const [selectedBank, setSelectedBank] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
 
   // Load banks for the selected country
   useEffect(() => {
     ;(async () => {
+      let text = ""
       try {
-        const session = (await supabase.auth.getSession()).data.session
-        const res = await fetch(`/functions/v1/gc_institutions?country=${country}`, {
-          headers: { Authorization: `Bearer ${session?.access_token}` },
-        })
-        if (!res.ok) throw new Error(await res.text())
-        const list = await res.json()
-        const simplified = (list || []).map((b: any) => ({ id: b.id, name: b.name }))
-        setBanks(simplified)
-        setSelectedBank(simplified[0]?.id ?? null)
+        const {
+          data: { session },
+        } = await supabase.auth.getSession()
+        if (!session) {
+          console.error("No auth session available")
+          throw new Error("Unauthorized")
+        }
+        const functionsUrl = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1`;
+        const res = await fetch(
+          `${functionsUrl}/gc_institutions?country=${country}`,
+          {
+            headers: { Authorization: `Bearer ${session.access_token}` },
+          },
+        )
+        text = await res.text()
+        if (!res.ok) {
+          console.error("Failed gc_institutions:", text)
+          throw new Error(text)
+        }
+        const contentType = res.headers.get("content-type") ?? ""
+        if (!contentType.includes("application/json")) {
+          console.error(
+            "Invalid content type from gc_institutions:",
+            contentType,
+            text,
+          )
+          throw new Error(`Invalid content type: ${contentType}`)
+        }
+        let list: Institution[]
+        try {
+          list = JSON.parse(text)
+        } catch {
+          console.error("Invalid JSON from gc_institutions:", text)
+          throw new Error(`Invalid JSON: ${text.slice(0, 100)}`)
+        }
+        if (!Array.isArray(list)) {
+          console.error("Unexpected institutions payload:", text)
+          throw new Error("Invalid institutions payload")
+        }
+        setBanks(list)
+        setSelectedBank(list[0]?.id ?? null)
       } catch (err) {
-        console.error("Failed loading banks:", err)
+        console.error("Failed loading banks:", err, text)
         setBanks([])
         setSelectedBank(null)
         toast({
@@ -68,11 +106,11 @@ export function BankConnection() {
       if (error) throw error
       if (!data?.link) throw new Error("Did not receive GoCardless link")
       window.location.href = data.link
-    } catch (err: any) {
+    } catch (err: unknown) {
       console.error("Create requisition failed:", err)
       toast({
         title: "Unable to start connection",
-        description: err?.message || "Please try again.",
+        description: (err as Error)?.message || "Please try again.",
         variant: "destructive",
       })
     } finally {

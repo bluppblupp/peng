@@ -26,7 +26,6 @@ export function BankCallbackPage() {
       }
 
       try {
-        // 1) Complete connection on server (upserts bank_accounts)
         setStatus("completing")
         setMessage("Finalizing connection…")
         const { data: completeData, error: completeErr } = await supabase.functions.invoke("gc_complete", {
@@ -34,7 +33,6 @@ export function BankCallbackPage() {
         })
         if (completeErr) throw completeErr
 
-        // 2) Find the connected_banks row for this requisition
         const { data: cb, error: cbErr } = await supabase
           .from("connected_banks")
           .select("id")
@@ -42,7 +40,6 @@ export function BankCallbackPage() {
           .single()
         if (cbErr || !cb?.id) throw new Error("Could not find connected bank record.")
 
-        // 3) List bank_accounts for this connection
         const { data: accounts, error: acctErr } = await supabase
           .from("bank_accounts")
           .select("id, name, currency")
@@ -55,7 +52,6 @@ export function BankCallbackPage() {
           return
         }
 
-        // 4) Auto-select all
         setStatus("selecting")
         setMessage("Selecting accounts…")
         const ids = accounts.map((a) => a.id)
@@ -65,7 +61,6 @@ export function BankCallbackPage() {
           .in("id", ids)
         if (selErr) throw selErr
 
-        // 5) Sync each selected account
         setStatus("syncing")
         setMessage("Syncing transactions…")
         for (const id of ids) {
@@ -79,16 +74,16 @@ export function BankCallbackPage() {
         setMessage("All set! Redirecting…")
         toast({ title: "Connected", description: "Accounts synced successfully." })
 
-        // Clear the query & redirect after a short delay (so the toast shows)
         window.history.replaceState({}, document.title, window.location.pathname)
         setTimeout(() => navigate("/transactions", { replace: true }), 350)
-      } catch (err: any) {
+      } catch (err: unknown) {
         console.error(err)
         setStatus("error")
-        setMessage(err?.message || "Something went wrong.")
+        const msg = err instanceof Error ? err.message : String(err)
+        setMessage(msg)
         toast({
           title: "Connection failed",
-          description: err?.message || "Please try again.",
+          description: msg || "Please try again.",
           variant: "destructive",
         })
       }
