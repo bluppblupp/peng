@@ -9,8 +9,8 @@ const allow = (req: Request) => ({
   "access-control-allow-methods": "POST, OPTIONS",
 })
 
-const BASE = Deno.env.get("GC_BASE")!
-const AUTH = "Bearer " + Deno.env.get("GC_SECRET_KEY")!
+const BASE = Deno.env.get("GOCARDLESS_BASE_URL")!
+const AUTH = "Bearer " + Deno.env.get("GOCARDLESS_SECRET_KEY")!
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!
 const SUPABASE_ANON_KEY = Deno.env.get("SUPABASE_ANON_KEY")!
 

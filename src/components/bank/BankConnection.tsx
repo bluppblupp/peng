@@ -4,6 +4,7 @@ import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card"
 import { Loader2, Plus } from "lucide-react"
 import { useToast } from "@/hooks/use-toast"
 import { supabase } from "@/integrations/supabase/client"
+const SUPABASE_URL = "https://cwbldfqsmcaqpdwiodrl.supabase.co";
 
 interface Institution {
   id: string
@@ -31,6 +32,7 @@ export function BankConnection() {
   const [banks, setBanks] = useState<Institution[]>([])
   const [selectedBank, setSelectedBank] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
+  
 
   // Load banks for the selected country
   useEffect(() => {
@@ -44,13 +46,16 @@ export function BankConnection() {
           console.error("No auth session available")
           throw new Error("Unauthorized")
         }
-        const functionsUrl = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1`;
-        const res = await fetch(
-          `${functionsUrl}/gc_institutions?country=${country}`,
-          {
-            headers: { Authorization: `Bearer ${session.access_token}` },
-          },
-        )
+       // BankConnection.tsx
+
+const functionsUrl = `${SUPABASE_URL}/functions/v1`;
+
+const res = await fetch(
+  `${functionsUrl}/gc_institutions?country=${country}`,
+  { headers: { Authorization: `Bearer ${session?.access_token}` } }
+);
+
+        
         text = await res.text()
         if (!res.ok) {
           console.error("Failed gc_institutions:", text)
@@ -65,12 +70,12 @@ export function BankConnection() {
           )
           throw new Error(`Invalid content type: ${contentType}`)
         }
-        let list: Institution[]
+        let list: Institution[];
         try {
-          list = JSON.parse(text)
+          list = JSON.parse(text);
         } catch {
-          console.error("Invalid JSON from gc_institutions:", text)
-          throw new Error(`Invalid JSON: ${text.slice(0, 100)}`)
+          console.error("gc_institutions returned non‑JSON:", text);
+          throw new Error(`Invalid JSON: ${text.slice(0, 100)}`);
         }
         if (!Array.isArray(list)) {
           console.error("Unexpected institutions payload:", text)
