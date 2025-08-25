@@ -4,7 +4,12 @@ import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card"
 import { Loader2, Plus } from "lucide-react"
 import { useToast } from "@/hooks/use-toast"
 import { supabase } from "@/integrations/supabase/client"
+
+// This constant is used to manually build the function URL.
 const SUPABASE_URL = "https://cwbldfqsmcaqpdwiodrl.supabase.co";
+
+// The Supabase URL should be managed via environment variables
+// Example: const SUPABASE_URL = process.env.REACT_APP_SUPABASE_URL;
 
 interface Institution {
   id: string
@@ -26,75 +31,85 @@ const COUNTRIES = [
   { code: "PL", label: "Poland" },
 ]
 
+// Custom hook to handle fetching bank institutions
+const useBanks = (country: string) => {
+  const [banks, setBanks] = useState<Institution[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const { toast } = useToast();
+
+  useEffect(() => {
+    const loadBanks = async () => {
+      if (!country) return;
+
+      setLoading(true);
+      setBanks([]);
+      setError(null);
+
+      try {
+        const { data: { session } } = await supabase.auth.getSession();
+        if (!session) {
+          throw new Error("Authentication failed. Please log in again.");
+        }
+        
+        const functionUrl = `${SUPABASE_URL}/functions/v1/gc_institutions`;
+        const response = await fetch(`${functionUrl}?country=${country}`, {
+            method: 'GET',
+            headers: {
+                'Authorization': `Bearer ${session.access_token}`,
+                'Content-Type': 'application/json'
+            }
+        });
+
+        if (!response.ok) {
+            const errorData = await response.json();
+            throw new Error(errorData.details || `Server error: ${response.status}`);
+        }
+
+        const data: Institution[] = await response.json();
+        if (!Array.isArray(data)) {
+            throw new Error("Invalid response from server");
+        }
+        
+        setBanks(data);
+
+      } catch (err) {
+        const errorMessage = err instanceof Error ? err.message : "An unknown error occurred.";
+        setError(errorMessage);
+        console.error("Failed loading banks:", err);
+        toast({
+          title: "Could not load banks",
+          description: errorMessage,
+          variant: "destructive",
+        });
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    loadBanks();
+  }, [country, toast]);
+
+  return { banks, loading, error };
+};
+
+
 export function BankConnection() {
   const { toast } = useToast()
   const [country, setCountry] = useState<string>("SE")
-  const [banks, setBanks] = useState<Institution[]>([])
+  const { banks, loading: banksLoading, error: banksError } = useBanks(country);
   const [selectedBank, setSelectedBank] = useState<string | null>(null)
-  const [loading, setLoading] = useState(false)
-  
+  const [connectLoading, setConnectLoading] = useState(false)
 
-  // Load banks for the selected country
+  // Update selected bank when the list of banks changes
   useEffect(() => {
-    ;(async () => {
-      let text = ""
-      try {
-        const {
-          data: { session },
-        } = await supabase.auth.getSession()
-        if (!session) {
-          console.error("No auth session available")
-          throw new Error("Unauthorized")
-        }
-       // BankConnection.tsx
+    if (banks.length > 0) {
+      setSelectedBank(banks[0].id);
+    } else {
+      setSelectedBank(null);
+    }
+  }, [banks]);
 
-const functionsUrl = `${SUPABASE_URL}/functions/v1`;
-
-const res = await fetch(
-  `${functionsUrl}/gc_institutions?country=${country}`,
-  { headers: { Authorization: `Bearer ${session?.access_token}` } }
-);
-
-        
-        text = await res.text()
-        if (!res.ok) {
-          console.error("Failed gc_institutions:", text)
-          throw new Error(text)
-        }
-        const contentType = res.headers.get("content-type") ?? ""
-        if (!contentType.includes("application/json")) {
-          console.error(
-            "Invalid content type from gc_institutions:",
-            contentType,
-            text,
-          )
-          throw new Error(`Invalid content type: ${contentType}`)
-        }
-        let list: Institution[];
-        try {
-          list = JSON.parse(text);
-        } catch {
-          console.error("gc_institutions returned non‑JSON:", text);
-          throw new Error(`Invalid JSON: ${text.slice(0, 100)}`);
-        }
-        if (!Array.isArray(list)) {
-          console.error("Unexpected institutions payload:", text)
-          throw new Error("Invalid institutions payload")
-        }
-        setBanks(list)
-        setSelectedBank(list[0]?.id ?? null)
-      } catch (err) {
-        console.error("Failed loading banks:", err, text)
-        setBanks([])
-        setSelectedBank(null)
-        toast({
-          title: "Could not load banks",
-          description: "Please try another country or refresh.",
-          variant: "destructive",
-        })
-      }
-    })()
-  }, [country, toast])
 
   // Start GoCardless flow
   const handleConnect = async () => {
@@ -102,11 +117,12 @@ const res = await fetch(
       toast({ title: "Pick a bank", description: "Choose a bank to continue." })
       return
     }
-    setLoading(true)
+    setConnectLoading(true)
     try {
       const redirectUrl = `${location.origin}/banks/callback`
+      const bank = banks.find(b => b.id === selectedBank);
       const { data, error } = await supabase.functions.invoke("gc_create_requisition", {
-        body: { institution_id: selectedBank, redirect_url: redirectUrl, bank_name: "Bank" },
+        body: { institution_id: selectedBank, redirect_url: redirectUrl, bank_name: bank?.name || "Bank" },
       })
       if (error) throw error
       if (!data?.link) throw new Error("Did not receive GoCardless link")
@@ -119,7 +135,7 @@ const res = await fetch(
         variant: "destructive",
       })
     } finally {
-      setLoading(false)
+      setConnectLoading(false)
     }
   }
 
@@ -148,8 +164,10 @@ const res = await fetch(
             className="border rounded p-2 min-w-[220px]"
             value={selectedBank ?? ""}
             onChange={(e) => setSelectedBank(e.target.value)}
-            disabled={banks.length === 0}
+            disabled={banks.length === 0 || banksLoading}
           >
+            {banksLoading && <option>Loading banks...</option>}
+            {!banksLoading && banks.length === 0 && <option>{banksError ? "Error loading banks" : "No banks found"}</option>}
             {banks.map((b) => (
               <option key={b.id} value={b.id}>
                 {b.name}
@@ -157,13 +175,13 @@ const res = await fetch(
             ))}
           </select>
 
-          <Button onClick={handleConnect} disabled={loading || !selectedBank}>
-            {loading ? (
+          <Button onClick={handleConnect} disabled={connectLoading || !selectedBank}>
+            {connectLoading ? (
               <Loader2 className="h-4 w-4 animate-spin mr-2" />
             ) : (
               <Plus className="h-4 w-4 mr-2" />
             )}
-            {loading ? "Connecting..." : "Connect"}
+            {connectLoading ? "Connecting..." : "Connect"}
           </Button>
         </div>
       </CardContent>

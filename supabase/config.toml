@@ -1,4 +1,4 @@
 project_id = "cwbldfqsmcaqpdwiodrl"
 
 [functions.gocardless]
-verify_jwt = false
+verify_jwt = true

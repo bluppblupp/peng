@@ -1,61 +1,88 @@
 // supabase/functions/gc_institutions/index.ts
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2"
+import "jsr:@supabase/functions-js/edge-runtime.d.ts";
+import { createClient } from "npm:@supabase/supabase-js@2.39.0";
 
-const allow = (req: Request) => ({
-  "access-control-allow-origin": "*",
-  "access-control-allow-headers":
-    req.headers.get("access-control-request-headers") ??
-    "authorization, content-type, x-client-info",
-  "access-control-allow-methods": "GET, OPTIONS",
-})
+// --- CORS Headers ---
+// Use a standard, robust CORS configuration to ensure headers are allowed.
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS", // Allow necessary methods
+  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+};
 
-const BASE = Deno.env.get("GOCARDLESS_BASE_URL")!
-const AUTH = "Bearer " + Deno.env.get("GOCARDLESS_SECRET_KEY")!
-const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!
-const SUPABASE_ANON_KEY = Deno.env.get("SUPABASE_ANON_KEY")!
-
+// --- Main Function Logic ---
 Deno.serve(async (req) => {
-  if (req.method === "OPTIONS") return new Response("ok", { headers: allow(req) })
-
-  const supa = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
-    global: { headers: { Authorization: req.headers.get("Authorization") ?? "" } },
-  })
-  const {
-    data: { user },
-  } = await supa.auth.getUser()
-  if (!user) {
-    return new Response(JSON.stringify({ error: "Unauthorized" }), {
-      status: 401,
-      headers: { "content-type": "application/json", ...allow(req) },
-    })
+  // Handle CORS preflight request immediately
+  if (req.method === "OPTIONS") {
+    return new Response("ok", { headers: corsHeaders });
   }
 
-  const url = new URL(req.url)
-  const country = url.searchParams.get("country") ?? "SE"
-
-  let r: Response
   try {
-    r = await fetch(`${BASE}/institutions/?country=${country}`, {
-      headers: { Authorization: AUTH },
-    })
+    // --- Environment Variables ---
+    const { GOCARDLESS_BASE_URL, GOCARDLESS_SECRET_ID, GOCARDLESS_SECRET_KEY, SUPABASE_URL, SUPABASE_ANON_KEY } = Deno.env.toObject();
+    
+    if (!GOCARDLESS_BASE_URL || !GOCARDLESS_SECRET_ID || !GOCARDLESS_SECRET_KEY || !SUPABASE_URL || !SUPABASE_ANON_KEY) {
+      throw new Error("Missing one or more required environment variables.");
+    }
+    
+    // --- Supabase User Authentication ---
+    const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+      global: { headers: { Authorization: req.headers.get("Authorization") || "" } },
+      auth: { persistSession: false },
+    });
+
+    const { data: { user }, error: authError } = await supabase.auth.getUser();
+    if (authError || !user) {
+      console.error("Supabase auth error:", authError?.message || "User not found");
+      throw new Error(`Authentication failed: ${authError?.message || "Auth session missing"}`);
+    }
+
+    // --- Get Temporary GoCardless Access Token ---
+    const tokenResponse = await fetch(`${GOCARDLESS_BASE_URL}/token/new/`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+        body: JSON.stringify({
+            secret_id: GOCARDLESS_SECRET_ID,
+            secret_key: GOCARDLESS_SECRET_KEY,
+        }),
+    });
+
+    if (!tokenResponse.ok) {
+        const errorBody = await tokenResponse.text();
+        throw new Error(`GoCardless token exchange failed: ${errorBody}`);
+    }
+
+    const { access: accessToken } = await tokenResponse.json();
+    if (!accessToken) {
+        throw new Error("Did not receive access token from GoCardless.");
+    }
+
+    // --- Fetch Institutions ---
+    const url = new URL(req.url);
+    const country = url.searchParams.get("country") || "SE";
+    const institutionsResponse = await fetch(`${GOCARDLESS_BASE_URL}/institutions/?country=${encodeURIComponent(country)}`, {
+      headers: {
+        'Authorization': `Bearer ${accessToken}`,
+        'Accept': 'application/json',
+      },
+    });
+
+    if (!institutionsResponse.ok) {
+        const errorBody = await institutionsResponse.text();
+        throw new Error(`Failed to fetch institutions: ${errorBody}`);
+    }
+
+    const institutions = await institutionsResponse.json();
+    return new Response(JSON.stringify(institutions), {
+      status: 200,
+      headers: { "Content-Type": "application/json", ...corsHeaders },
+    });
+
   } catch (err) {
-    console.error("gc_institutions fetch failed:", err)
-    return new Response(JSON.stringify({ error: String(err) }), {
-      status: 502,
-      headers: { "content-type": "application/json", ...allow(req) },
-    })
+    console.error("Error in gc_institutions function:", err.message);
+    return new Response(JSON.stringify({ error: "Internal Server Error", details: err.message }), {
+      status: 500,
+      headers: { "Content-Type": "application/json", ...corsHeaders },
+    });
   }
-
-  const text = await r.text()
-  let json: unknown
-  try {
-    json = JSON.parse(text)
-  } catch {
-    console.error("gc_institutions upstream non-json:", text)
-    json = { error: text }
-  }
-  return new Response(JSON.stringify(json), {
-    status: r.status,
-    headers: { "content-type": "application/json", ...allow(req) },
-  })
-})
+});
