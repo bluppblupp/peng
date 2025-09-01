@@ -9,9 +9,10 @@ const allow = (req: Request) => ({
     req.headers.get("access-control-request-headers") ??
     "authorization, Authorization, content-type, x-client-info, apikey",
   "access-control-allow-methods": "POST, OPTIONS",
+  Vary: "Origin, Access-Control-Request-Headers",
 });
 
-/** Helpers (no any) */
+/** Helpers */
 const errMessage = (e: unknown) =>
   e instanceof Error ? e.message : (() => { try { return typeof e === "string" ? e : JSON.stringify(e); } catch { return String(e); } })();
 const errStack = (e: unknown) => (e instanceof Error ? e.stack : undefined);
@@ -19,7 +20,6 @@ const bearerFrom = (req: Request) => {
   const hdr = req.headers.get("Authorization") || "";
   return hdr.startsWith("Bearer ") ? hdr.slice(7) : "";
 };
-/** Safe URL join: keeps base path (e.g., /api) */
 const joinUrl = (base: string, path: string) => {
   const b = base.endsWith("/") ? base : base + "/";
   const p = path.startsWith("/") ? path.slice(1) : path;
@@ -95,16 +95,9 @@ Deno.serve(async (req) => {
       SUPABASE_ANON_KEY,
     } = Deno.env.toObject();
 
-    // Validate env + base URL syntax
     let baseOk = true;
     try { new URL(GOCARDLESS_BASE_URL || ""); } catch { baseOk = false; }
-    if (
-      !baseOk ||
-      !GOCARDLESS_SECRET_ID ||
-      !GOCARDLESS_SECRET_KEY ||
-      !SUPABASE_URL ||
-      !SUPABASE_ANON_KEY
-    ) {
+    if (!baseOk || !GOCARDLESS_SECRET_ID || !GOCARDLESS_SECRET_KEY || !SUPABASE_URL || !SUPABASE_ANON_KEY) {
       console.error("gc_create_requisition env missing/invalid", {
         correlationId,
         have: {
@@ -122,12 +115,9 @@ Deno.serve(async (req) => {
     }
     console.log("gc_create_requisition gate: env ok", { correlationId });
 
-    // --- Auth (log presence + user id)
+    // --- Auth
     const token = bearerFrom(req);
-    console.log("gc_create_requisition gate: auth header", {
-      hasAuth: !!token,
-      correlationId,
-    });
+    console.log("gc_create_requisition gate: auth header", { hasAuth: !!token, correlationId });
     const supa = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
       global: { headers: { Authorization: `Bearer ${token}` } },
       auth: { persistSession: false },
@@ -143,21 +133,30 @@ Deno.serve(async (req) => {
     console.log("gc_create_requisition gate: auth ok", { correlationId, userId: user.id });
 
     // --- Body
-    let bodyUnknown: unknown;
+    const ct = req.headers.get("content-type") || "";
+    const rawBody = await req.text();
+    console.log("gc_create_requisition gate: body headers", {
+      correlationId,
+      contentType: ct,
+      hasBody: rawBody.length > 0,
+      preview: rawBody.slice(0, 80),
+    });
+
+    let parsed: unknown;
     try {
-      bodyUnknown = await req.json();
+      parsed = rawBody ? JSON.parse(rawBody) : null;
     } catch {
-      console.error("gc_create_requisition bad json", { correlationId });
+      console.error("gc_create_requisition bad json", { correlationId, rawPreview: rawBody.slice(0, 200) });
       return new Response(JSON.stringify({ error: "Bad Request", code: "INVALID_JSON", correlationId }), {
         status: 400,
         headers: { "content-type": "application/json", ...allow(req) },
       });
     }
-    const { institution_id, redirect_url, bank_name, country }: CreateReqBody = (bodyUnknown as CreateReqBody) ?? {};
-    console.log("gc_create_requisition gate: body", {
+    const { institution_id, redirect_url, bank_name, country }: CreateReqBody = (parsed as CreateReqBody) ?? {};
+    console.log("gc_create_requisition gate: body fields", {
+      correlationId,
       hasInstitution: !!institution_id,
       hasRedirect: !!redirect_url,
-      correlationId,
     });
     if (!institution_id || !redirect_url) {
       return new Response(JSON.stringify({ error: "Bad Request", code: "MISSING_FIELDS", correlationId }), {
@@ -166,10 +165,22 @@ Deno.serve(async (req) => {
       });
     }
 
+    // Validate redirect URL is absolute
+    try { new URL(redirect_url); } catch {
+      return new Response(JSON.stringify({
+        error: "Bad Request",
+        code: "MISSING_FIELDS_REDIRECT",
+        correlationId,
+      }), { status: 400, headers: { "content-type": "application/json", ...allow(req) } });
+    }
+
+    // Accept-Language → user_language
+    const acceptLang = (req.headers.get("accept-language") || "").split(",")[0]?.slice(0, 2) || "en";
+
     // --- Token exchange
     console.log("gc_create_requisition step: token/new", { correlationId });
     const tokenRes = await fetchWithRetry(
-      joinUrl(GOCARDLESS_BASE_URL!, "token/new/"),
+      joinUrl(GOCARDLESS_BASE_URL, "token/new/"),
       {
         method: "POST",
         headers: { "Content-Type": "application/json", Accept: "application/json" },
@@ -183,10 +194,12 @@ Deno.serve(async (req) => {
       console.error("gc_create_requisition token error", {
         correlationId, status: tokenRes.status, bodySnippet: t.slice(0, 300), userId: user.id,
       });
-      return new Response(JSON.stringify({ error: "Bad Gateway", code: "UPSTREAM_TOKEN_ERROR", correlationId }), {
-        status: 502,
-        headers: { "content-type": "application/json", ...allow(req) },
-      });
+      return new Response(JSON.stringify({
+        error: "Bad Gateway",
+        code: "UPSTREAM_TOKEN_ERROR",
+        correlationId,
+        details: { status: tokenRes.status, bodySnippet: t.slice(0, 300) },
+      }), { status: 502, headers: { "content-type": "application/json", ...allow(req) } });
     }
     const tokenJson = (await tokenRes.json().catch(() => ({}))) as GcTokenJson;
     const accessToken = tokenJson.access ?? "";
@@ -194,16 +207,15 @@ Deno.serve(async (req) => {
       console.error("gc_create_requisition token missing 'access'", {
         correlationId, tokenJsonSnippet: JSON.stringify(tokenJson).slice(0, 300), userId: user.id,
       });
-      return new Response(JSON.stringify({ error: "Bad Gateway", code: "UPSTREAM_TOKEN_MALFORMED", correlationId }), {
-        status: 502,
-        headers: { "content-type": "application/json", ...allow(req) },
-      });
+      return new Response(JSON.stringify({
+        error: "Bad Gateway", code: "UPSTREAM_TOKEN_MALFORMED", correlationId,
+      }), { status: 502, headers: { "content-type": "application/json", ...allow(req) } });
     }
 
-    // --- End-user agreement
+    // --- EUA (requires institution_id)
     console.log("gc_create_requisition step: agreements/enduser", { correlationId });
     const euaRes = await fetchWithRetry(
-      joinUrl(GOCARDLESS_BASE_URL!, "agreements/enduser/"),
+      joinUrl(GOCARDLESS_BASE_URL, "agreements/enduser/"),
       {
         method: "POST",
         headers: {
@@ -212,6 +224,7 @@ Deno.serve(async (req) => {
           Accept: "application/json",
         },
         body: JSON.stringify({
+          institution_id,
           max_historical_days: 365,
           access_valid_for_days: 180,
           access_scope: ["balances", "details", "transactions"],
@@ -225,23 +238,24 @@ Deno.serve(async (req) => {
       console.error("gc_create_requisition eua error", {
         correlationId, status: euaRes.status, bodySnippet: text.slice(0, 400), userId: user.id,
       });
-      return new Response(JSON.stringify({ error: "Bad Gateway", code: "UPSTREAM_EUA_ERROR", correlationId }), {
-        status: 502,
-        headers: { "content-type": "application/json", ...allow(req) },
-      });
+      return new Response(JSON.stringify({
+        error: "Bad Gateway",
+        code: "UPSTREAM_EUA_ERROR",
+        correlationId,
+        details: { status: euaRes.status, bodySnippet: text.slice(0, 400) },
+      }), { status: 502, headers: { "content-type": "application/json", ...allow(req) } });
     }
     const eua = (await euaRes.json().catch(() => ({}))) as GcAgreement;
     if (!eua?.id) {
       return new Response(JSON.stringify({ error: "Bad Gateway", code: "UPSTREAM_EUA_MALFORMED", correlationId }), {
-        status: 502,
-        headers: { "content-type": "application/json", ...allow(req) },
+        status: 502, headers: { "content-type": "application/json", ...allow(req) },
       });
     }
 
     // --- Create requisition
     console.log("gc_create_requisition step: requisitions", { correlationId });
     const reqRes = await fetchWithRetry(
-      joinUrl(GOCARDLESS_BASE_URL!, "requisitions/"),
+      joinUrl(GOCARDLESS_BASE_URL, "requisitions/"),
       {
         method: "POST",
         headers: {
@@ -253,7 +267,7 @@ Deno.serve(async (req) => {
           redirect: redirect_url,
           institution_id,
           agreement: eua.id,
-          user_language: "sv",
+          user_language: acceptLang,
           reference: crypto.randomUUID(),
         }),
       },
@@ -265,10 +279,12 @@ Deno.serve(async (req) => {
       console.error("gc_create_requisition upstream requisition error", {
         correlationId, status: reqRes.status, bodySnippet: text.slice(0, 500), userId: user.id, institution_id,
       });
-      return new Response(JSON.stringify({ error: "Bad Gateway", code: "UPSTREAM_REQUISITION_ERROR", correlationId }), {
-        status: 502,
-        headers: { "content-type": "application/json", ...allow(req) },
-      });
+      return new Response(JSON.stringify({
+        error: "Bad Gateway",
+        code: "UPSTREAM_REQUISITION_ERROR",
+        correlationId,
+        details: { status: reqRes.status, bodySnippet: text.slice(0, 500) },
+      }), { status: 502, headers: { "content-type": "application/json", ...allow(req) } });
     }
 
     const rqJson = (await reqRes.json().catch(() => ({}))) as Record<string, unknown>;
@@ -279,32 +295,35 @@ Deno.serve(async (req) => {
         correlationId, userId: user.id, rqSnippet: JSON.stringify(rqJson).slice(0, 400),
       });
       return new Response(JSON.stringify({ error: "Bad Gateway", code: "UPSTREAM_MALFORMED", correlationId }), {
-        status: 502,
-        headers: { "content-type": "application/json", ...allow(req) },
+        status: 502, headers: { "content-type": "application/json", ...allow(req) },
       });
     }
 
-    // --- Insert connected bank
-    console.log("gc_create_requisition step: DB insert", { correlationId });
+    // --- DB: UPSERT to avoid duplicate key on (user_id, account_id)
+    // Use requisitionId as a temporary UNIQUE account_id (placeholder)
+    console.log("gc_create_requisition step: DB upsert", { correlationId });
     const { data: cb, error } = await supa
       .from("connected_banks")
-      .insert({
-        user_id: user.id,
-        bank_name: bank_name ?? "Bank",
-        account_id: "",
-        institution_id,
-        is_active: true,
-        provider: "gocardless",
-        link_id: requisitionId,
-        country: country ?? "SE",
-        status: "pending",
-      })
-      .select()
+      .upsert(
+        {
+          user_id: user.id,
+          bank_name: bank_name ?? "Bank",
+          account_id: requisitionId,      // << placeholder to satisfy (user_id, account_id) uniqueness
+          institution_id,
+          is_active: true,
+          provider: "gocardless",
+          link_id: requisitionId,
+          country: country ?? "SE",
+          status: "pending",
+        },
+        { onConflict: "user_id,account_id" }
+      )
+      .select("id")
       .single();
 
     if (error) {
-      console.error("gc_create_requisition DB insert error", { correlationId, userId: user.id, msg: error.message });
-      return new Response(JSON.stringify({ error: "Database Error", code: "DB_INSERT_FAILED", correlationId }), {
+      console.error("gc_create_requisition DB upsert error", { correlationId, userId: user.id, msg: error.message });
+      return new Response(JSON.stringify({ error: "Database Error", code: "DB_UPSERT_FAILED", correlationId }), {
         status: 500,
         headers: { "content-type": "application/json", ...allow(req) },
       });

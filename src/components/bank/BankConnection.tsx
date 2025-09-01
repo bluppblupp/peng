@@ -72,7 +72,7 @@ const useBanks = (country: string) => {
         const msg =
           e instanceof Error ? e.message : typeof e === "string" ? e : "An unknown error occurred.";
         if (!cancelled) setError(msg);
-        console.error("Failed loading banks:", e);
+        console.error("Could not load banks:", e);
         toast({
           title: "Could not load banks",
           description: msg,
@@ -92,6 +92,11 @@ const useBanks = (country: string) => {
   return { banks, loading, error };
 };
 
+/** Type guard to read Response from Supabase function errors */
+function isResponseLike(x: unknown): x is Response {
+  return typeof Response !== "undefined" && x instanceof Response;
+}
+
 export function BankConnection() {
   const { toast } = useToast();
   const [country, setCountry] = useState<string>("SE");
@@ -99,7 +104,6 @@ export function BankConnection() {
   const [selectedBank, setSelectedBank] = useState<string | null>(null);
   const [connectLoading, setConnectLoading] = useState(false);
 
-  // Update selected bank when the list changes
   useEffect(() => {
     if (banks.length > 0) {
       setSelectedBank(banks[0].id);
@@ -108,57 +112,62 @@ export function BankConnection() {
     }
   }, [banks]);
 
-  // Start GoCardless flow
- const handleConnect = async () => {
-  if (!selectedBank) {
-    toast({ title: "Pick a bank", description: "Choose a bank to continue." });
-    return;
-  }
-  setConnectLoading(true);
-  try {
-    const {
-      data: { session },
-    } = await supabase.auth.getSession();
-    if (!session) throw new Error("Authentication failed. Please log in again.");
+  const handleConnect = async () => {
+    if (!selectedBank) {
+      toast({ title: "Pick a bank", description: "Choose a bank to continue." });
+      return;
+    }
+    setConnectLoading(true);
+    try {
+      const {
+        data: { session },
+      } = await supabase.auth.getSession();
+      if (!session) throw new Error("Authentication failed. Please log in again.");
 
-    const redirectUrl = `${location.origin}/banks/callback`;
-    const bank = banks.find((b) => b.id === selectedBank);
+      const redirectUrl = `${location.origin}/banks/callback`;
+      const bank = banks.find((b) => b.id === selectedBank);
 
-    const { data, error } = await supabase.functions.invoke("gc_create_requisition", {
-  method: "POST",
-  headers: {
-    "Content-Type": "application/json",
-    Authorization: `Bearer ${session.access_token}`,
-    apikey: import.meta.env.VITE_SUPABASE_ANON_KEY!,
-  },
-  body: {
-    institution_id: selectedBank,
-    redirect_url: redirectUrl,
-    bank_name: bank?.name || "Bank",
-  },
-});
+      const { data, error } = await supabase.functions.invoke("gc_create_requisition", {
+        // Let SDK post JSON and attach JWT+apikey
+        body: {
+          institution_id: selectedBank,
+          redirect_url: redirectUrl,
+          bank_name: bank?.name || "Bank",
+        },
+      });
 
-if (error) {
-  // Supabase packs the function’s JSON into error.context if it was JSON
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const ctx = (error as any)?.context;
-  console.error("gc_create_requisition failed", { message: error.message, ctx });
-  throw new Error(ctx?.code ? `${ctx.code} (${ctx.correlationId || "no-id"})` : error.message);
-}
+      if (error) {
+        // Try to extract the function's JSON to show {code, correlationId, details}
+        const ctx = (error as { context?: unknown }).context;
+        if (ctx && isResponseLike(ctx)) {
+          try {
+            const json = await ctx.clone().json();
+            console.error("gc_create_requisition failed", { message: error.message, json });
+            const code = typeof json?.code === "string" ? json.code : "";
+            const cid = typeof json?.correlationId === "string" ? json.correlationId : "";
+            const upstream = json?.details?.bodySnippet ? ` · ${json.details.bodySnippet}` : "";
+            throw new Error(`${code || error.message}${cid ? ` (${cid})` : ""}${upstream}`);
+          } catch {
+            // fall back to generic message
+          }
+        }
+        throw new Error(error.message);
+      }
 
-
-    if (error) throw error;
-    if (!data?.link) throw new Error("Did not receive GoCardless link");
-    window.location.href = data.link;
-  } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : "Please try again.";
-    console.error("Create requisition failed:", e);
-    toast({ title: "Unable to start connection", description: msg, variant: "destructive" });
-  } finally {
-    setConnectLoading(false);
-  }
-};
-
+      if (!data?.link) throw new Error("Did not receive GoCardless link");
+      window.location.href = data.link;
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : "Please try again.";
+      console.error("Create requisition failed:", e);
+      toast({
+        title: "Unable to start connection",
+        description: msg,
+        variant: "destructive",
+      });
+    } finally {
+      setConnectLoading(false);
+    }
+  };
 
   return (
     <Card>
