@@ -5,11 +5,6 @@ import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
 import { Loader2 } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 
-function getRequisitionId(): string | null {
-  const p = new URLSearchParams(window.location.search);
-  return p.get("r") || p.get("requisition_id") || p.get("ref");
-}
-
 type CompleteAccountMeta = {
   id: string;
   name: string;
@@ -42,19 +37,28 @@ async function parseFunctionError(err: { message: string; context?: unknown }): 
   return null;
 }
 
+function readCallbackParams() {
+  const p = new URLSearchParams(window.location.search);
+  // requisition id is commonly in "requisition_id" (sometimes "r")
+  const requisitionId = p.get("requisition_id") ?? p.get("r") ?? null;
+  // reference (your UUID you sent when creating the requisition) is often "reference" or "ref"
+  const reference = p.get("reference") ?? p.get("ref") ?? null;
+  return { requisitionId, reference };
+}
+
 export function BankCallbackPage() {
   const { toast } = useToast();
   const navigate = useNavigate();
+  const [{ requisitionId, reference }] = useState(readCallbackParams);
   const [status, setStatus] = useState<"idle" | "completing" | "retrying" | "selecting" | "syncing" | "done" | "error">("idle");
   const [message, setMessage] = useState<string>("");
-  const requisitionId = getRequisitionId();
   const [retried, setRetried] = useState(false);
 
   useEffect(() => {
     (async () => {
-      if (!requisitionId) {
+      if (!requisitionId && !reference) {
         setStatus("error");
-        setMessage("Missing requisition id.");
+        setMessage("Missing requisition information.");
         return;
       }
 
@@ -67,15 +71,21 @@ export function BankCallbackPage() {
         setMessage("Finalizing connection…");
 
         const completeRes = await supabase.functions.invoke<{ accounts?: CompleteAccountMeta[] }>("gc_complete", {
-          body: { requisition_id: requisitionId },
+          body: { requisition_id: requisitionId ?? undefined, reference: reference ?? undefined },
         });
 
         if (completeRes.error) {
-          // See if it's a not-linked/expired case we can retry
           const json = await parseFunctionError(completeRes.error);
-          if (!retried && json && (json.code === "REQUISTION_NOT_LINKED" || json.code === "REQUISTION_EXPIRED")) {
-            const institutionId = typeof json.details?.institution_id === "string" ? json.details.institution_id : null;
-            const bankName = typeof json.details?.bank_name === "string" ? json.details.bank_name : "Bank";
+
+          // accept both the correct codes and the earlier misspelled ones
+          const NOT_LINKED =
+            json?.code === "REQUISITION_NOT_LINKED" || json?.code === "REQUISTION_NOT_LINKED";
+          const EXPIRED =
+            json?.code === "REQUISITION_EXPIRED" || json?.code === "REQUISTION_EXPIRED";
+
+          if (!retried && (NOT_LINKED || EXPIRED)) {
+            const institutionId = typeof json?.details?.institution_id === "string" ? (json!.details!.institution_id as string) : null;
+            const bankName = typeof json?.details?.bank_name === "string" ? (json!.details!.bank_name as string) : "Bank";
             if (institutionId) {
               // 1a) Create a new requisition and redirect
               setRetried(true);
@@ -93,7 +103,6 @@ export function BankCallbackPage() {
               });
 
               if (createRes.error) {
-                // parse and show cleaner message
                 const createJson = await parseFunctionError(createRes.error);
                 const code = createJson?.code ? ` (${createJson.code}${createJson.correlationId ? ` · ${createJson.correlationId}` : ""})` : "";
                 throw new Error((createJson?.error || createRes.error.message) + code);
@@ -126,7 +135,7 @@ export function BankCallbackPage() {
           const cbRes = await supabase
             .from("connected_banks")
             .select("id")
-            .eq("link_id", requisitionId)
+            .eq("link_id", requisitionId ?? reference ?? "")
             .single();
 
           if (cbRes.error || !cbRes.data?.id) throw new Error("Could not find connected bank record.");
@@ -192,7 +201,7 @@ export function BankCallbackPage() {
         });
       }
     })();
-  }, [requisitionId, navigate, toast, retried]);
+  }, [requisitionId, reference, navigate, toast, retried]);
 
   return (
     <Card>

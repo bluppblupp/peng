@@ -1,232 +1,103 @@
+// supabase/functions/gc_institutions/index.ts
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "npm:@supabase/supabase-js@2.39.0";
+import {
+  allow, bearerFrom, errMessage,
+  normalizeBase, nint, newGcToken, gcFetchRaw, isRecord, getString
+} from "../_shared/gc.ts";
 
-/** CORS */
-const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-  "Access-Control-Allow-Headers":
-    "authorization, Authorization, x-client-info, apikey, content-type",
-};
-
-/** Allowed country codes (must match your UI) */
-const ALLOWED_COUNTRIES = new Set([
-  "SE", "NO", "DK", "FI", "GB", "DE", "NL", "FR", "ES", "IT", "IE", "PL",
-]);
-
-/** Simple in-memory cache (best-effort per warm instance) */
 type Institution = { id: string; name: string };
-type CacheEntry = { data: Institution[]; expires: number };
-const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
-const institutionsCache = new Map<string, CacheEntry>();
-
-/** Error helpers */
-function errMessage(e: unknown): string {
-  if (e instanceof Error) return e.message;
-  try { return typeof e === "string" ? e : JSON.stringify(e); } catch { return String(e); }
-}
-function errStack(e: unknown): string | undefined {
-  return e instanceof Error ? e.stack : undefined;
-}
-
-/** Lightweight retry helper for 429/5xx */
-async function fetchWithRetry(
-  url: string,
-  init: RequestInit,
-  tries = 2,
-  baseDelayMs = 300
-): Promise<Response> {
-  let attempt = 0;
-  let lastBody = "";
-  while (attempt <= tries) {
-    const res = await fetch(url, init);
-    if (res.ok) return res;
-
-    lastBody = await res.text().catch(() => "");
-    if (res.status === 429 || res.status >= 500) {
-      await new Promise((r) => setTimeout(r, baseDelayMs * (attempt + 1)));
-      attempt++;
-      continue;
-    }
-    return new Response(lastBody || "", { status: res.status });
-  }
-  return new Response(lastBody || "Upstream error after retries", { status: 502 });
-}
+type Body = { country?: string };
 
 Deno.serve(async (req) => {
-  if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
-
   const correlationId = crypto.randomUUID();
 
+  // ✅ req is in scope here
+  if (req.method === "OPTIONS") return new Response("ok", { headers: allow(req) });
+  console.log("gc_institutions start", {
+    method: req.method,
+    hasAuth: !!req.headers.get("Authorization"),
+    ua: (req.headers.get("User-Agent") || "").slice(0, 60),
+    correlationId,
+  });
+
   try {
-    const {
-      GOCARDLESS_BASE_URL,
-      GOCARDLESS_SECRET_ID,
-      GOCARDLESS_SECRET_KEY,
-      SUPABASE_URL,
-      SUPABASE_ANON_KEY,
-    } = Deno.env.toObject();
-
-    if (
-      !GOCARDLESS_BASE_URL || !GOCARDLESS_SECRET_ID || !GOCARDLESS_SECRET_KEY ||
-      !SUPABASE_URL || !SUPABASE_ANON_KEY
-    ) {
-      console.error("gc_institutions env missing", {
-        correlationId,
-        have: {
-          GOCARDLESS_BASE_URL: !!GOCARDLESS_BASE_URL,
-          GOCARDLESS_SECRET_ID: !!GOCARDLESS_SECRET_ID,
-          GOCARDLESS_SECRET_KEY: !!GOCARDLESS_SECRET_KEY,
-          SUPABASE_URL: !!SUPABASE_URL,
-          SUPABASE_ANON_KEY: !!SUPABASE_ANON_KEY,
-        },
+    if (req.method !== "GET" && req.method !== "POST") {
+      return new Response(JSON.stringify({ error: "Method Not Allowed", code: "METHOD_NOT_ALLOWED", correlationId }), {
+        status: 405, headers: { "content-type": "application/json", ...allow(req) },
       });
-      return new Response(JSON.stringify({
-        error: "Internal Server Error", code: "CONFIG_MISSING", correlationId,
-      }), { status: 500, headers: { "Content-Type": "application/json", ...corsHeaders } });
     }
+    // Env
+    const rawEnv = Deno.env.toObject();
+    let baseOk = true;
+    try { new URL(rawEnv.GOCARDLESS_BASE_URL || ""); } catch { baseOk = false; }
+    if (!baseOk || !rawEnv.GOCARDLESS_SECRET_ID || !rawEnv.GOCARDLESS_SECRET_KEY || !rawEnv.SUPABASE_URL || !rawEnv.SUPABASE_ANON_KEY) {
+      return new Response(JSON.stringify({ error: "Internal Server Error", code: "CONFIG_MISSING", correlationId }), {
+        status: 500, headers: { "content-type": "application/json", ...allow(req) },
+      });
+    }
+    const env = {
+      GOCARDLESS_BASE_URL: normalizeBase(rawEnv.GOCARDLESS_BASE_URL!),
+      GOCARDLESS_SECRET_ID: rawEnv.GOCARDLESS_SECRET_ID!,
+      GOCARDLESS_SECRET_KEY: rawEnv.GOCARDLESS_SECRET_KEY!,
+      SUPABASE_URL: rawEnv.SUPABASE_URL!,
+      SUPABASE_ANON_KEY: rawEnv.SUPABASE_ANON_KEY!,
+      TIMEOUT_TOKEN_MS: nint(rawEnv.GC_TIMEOUT_TOKEN_MS, 10_000),
+    };
 
-    // --- Parse Bearer token from header and call getUser(token) explicitly ---
-    const authHdr = req.headers.get("Authorization") || "";
-    // Temporary diagnostics (remove when confirmed):
-    console.log("gc_institutions Authorization present?", {
-      has: !!authHdr,
-      preview: authHdr ? authHdr.slice(0, 16) + "…" : "none",
+    // Auth (Supabase)
+    const token = bearerFrom(req);
+    const supa = createClient(env.SUPABASE_URL, env.SUPABASE_ANON_KEY, {
+      global: { headers: { Authorization: `Bearer ${token}` } }, auth: { persistSession: false },
     });
-    const token = authHdr.startsWith("Bearer ") ? authHdr.slice(7) : "";
-
-    const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
-      // Keeping global header is harmless, but the key change is passing token below.
-      global: { headers: { Authorization: authHdr } },
-      auth: { persistSession: false },
-    });
-
-    // ✅ Pass the token; do NOT rely on internal session in Edge Functions.
-    const { data: { user }, error: authError } = await supabase.auth.getUser(token);
+    const { data: { user }, error: authError } = await supa.auth.getUser(token);
     if (authError || !user) {
-      return new Response(JSON.stringify({
-        error: "Unauthorized", code: "AUTH_REQUIRED", correlationId,
-      }), { status: 401, headers: { "Content-Type": "application/json", ...corsHeaders } });
-    }
-
-    // --- Determine country (POST body > query param > default) ---
-    let country = "SE";
-    if (req.method === "POST") {
-      try {
-        const body = await req.json();
-        if (typeof body?.country === "string" && body.country.trim()) country = body.country.trim();
-      } catch { /* ignore parse error */ }
-    } else if (req.method === "GET") {
-      const url = new URL(req.url);
-      const qpCountry = url.searchParams.get("country");
-      if (qpCountry) country = qpCountry;
-    }
-
-    // Validate country
-    if (!ALLOWED_COUNTRIES.has(country)) {
-      return new Response(JSON.stringify({
-        error: "Bad Request", code: "INVALID_COUNTRY", correlationId,
-      }), { status: 400, headers: { "Content-Type": "application/json", ...corsHeaders } });
-    }
-
-    // Cache
-    const now = Date.now();
-    const cached = institutionsCache.get(country);
-    if (cached && cached.expires > now) {
-      return new Response(JSON.stringify(cached.data), {
-        status: 200, headers: { "Content-Type": "application/json", ...corsHeaders },
+      return new Response(JSON.stringify({ error: "Unauthorized", code: "AUTH_REQUIRED", correlationId }), {
+        status: 401, headers: { "content-type": "application/json", ...allow(req) },
       });
     }
 
-    // Get GoCardless access token (retry)
-    const tokenRes = await fetchWithRetry(`${GOCARDLESS_BASE_URL}/token/new/`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Accept: "application/json" },
-      body: JSON.stringify({ secret_id: GOCARDLESS_SECRET_ID, secret_key: GOCARDLESS_SECRET_KEY }),
-    }, 2);
+    const country = new URL(req.url).searchParams.get("country") || "SE";
 
-    if (!tokenRes.ok) {
-      const body = await tokenRes.text().catch(() => "");
-      console.error("gc_institutions token error", {
-        correlationId, status: tokenRes.status, bodySnippet: body.slice(0, 300), userId: user.id,
-      });
-      return new Response(JSON.stringify({
-        error: "Bad Gateway", code: "UPSTREAM_TOKEN_ERROR", correlationId,
-      }), { status: 502, headers: { "Content-Type": "application/json", ...corsHeaders } });
-    }
+    // GoCardless call
+    const tokenHolder = { token: await newGcToken(env, correlationId) };
+    const refresh = (cid: string) => newGcToken(env, cid);
 
-    const tokenJson = await tokenRes.json().catch(() => ({} as unknown));
-    const accessToken = (tokenJson as { access?: string } | null)?.access ?? undefined;
-    if (!accessToken) {
-      console.error("gc_institutions token missing 'access'", {
-        correlationId, tokenJsonSnippet: JSON.stringify(tokenJson).slice(0, 300), userId: user.id,
-      });
-      return new Response(JSON.stringify({
-        error: "Bad Gateway", code: "UPSTREAM_TOKEN_MALFORMED", correlationId,
-      }), { status: 502, headers: { "Content-Type": "application/json", ...corsHeaders } });
-    }
-
-    // Fetch institutions (retry)
-    const instRes = await fetchWithRetry(
-      `${GOCARDLESS_BASE_URL}/institutions/?country=${encodeURIComponent(country)}`,
-      { headers: { Authorization: `Bearer ${accessToken}`, Accept: "application/json" } },
-      2
+    const res = await gcFetchRaw(
+      env, tokenHolder,
+      `institutions/?country=${encodeURIComponent(country)}`,
+      { method: "GET" },
+      correlationId,
+      12_000,
+      refresh
     );
 
-    if (!instRes.ok) {
-      const body = await instRes.text().catch(() => "");
-      console.error("gc_institutions upstream institutions error", {
-        correlationId, status: instRes.status, bodySnippet: body.slice(0, 300), userId: user.id, country,
-      });
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
       return new Response(JSON.stringify({
         error: "Bad Gateway", code: "UPSTREAM_INSTITUTIONS_ERROR", correlationId,
-      }), { status: 502, headers: { "Content-Type": "application/json", ...corsHeaders } });
+        details: { status: res.status, bodySnippet: body.slice(0, 400) },
+      }), { status: 502, headers: { "content-type": "application/json", ...allow(req) } });
     }
 
-    // Map upstream payload to DTO
-    const rawUnknown = await instRes.json().catch(() => null as unknown);
-    let institutions: Institution[] = [];
+    const json = (await res.json().catch(() => ([]))) as unknown;
+    const list: Institution[] = Array.isArray(json)
+      ? (json as unknown[]).map((r) => {
+          const id = isRecord(r) ? getString(r, "id") : null;
+          const name = isRecord(r) ? (getString(r, "name") || getString(r, "full_name") || getString(r, "official_name")) : null;
+          if (id && name) return { id, name };
+          return null;
+        }).filter((x): x is Institution => !!x)
+      : [];
 
-    if (Array.isArray(rawUnknown)) {
-      institutions = rawUnknown
-        .map((r) =>
-          r && typeof r === "object" && "id" in r && "name" in r
-            ? { id: String((r as Record<string, unknown>).id), name: String((r as Record<string, unknown>).name) }
-            : null
-        )
-        .filter((x): x is Institution => !!x && typeof x.id === "string" && typeof x.name === "string");
-    } else if (
-      rawUnknown && typeof rawUnknown === "object" &&
-      Array.isArray((rawUnknown as Record<string, unknown>).results)
-    ) {
-      const results = (rawUnknown as Record<string, unknown>).results as unknown[];
-      institutions = results
-        .map((r) =>
-          r && typeof r === "object" && "id" in r && "name" in r
-            ? { id: String((r as Record<string, unknown>).id), name: String((r as Record<string, unknown>).name) }
-            : null
-        )
-        .filter((x): x is Institution => !!x && typeof x.id === "string" && typeof x.name === "string");
-    } else {
-      console.error("gc_institutions unexpected upstream shape", {
-        correlationId, userId: user.id, country, rawSnippet: JSON.stringify(rawUnknown).slice(0, 300),
-      });
-      return new Response(JSON.stringify({
-        error: "Bad Gateway", code: "UPSTREAM_MALFORMED", correlationId,
-      }), { status: 502, headers: { "Content-Type": "application/json", ...corsHeaders } });
-    }
-
-    // Update cache & return
-    institutionsCache.set(country, { data: institutions, expires: now + CACHE_TTL_MS });
-    return new Response(JSON.stringify(institutions), {
-      status: 200, headers: { "Content-Type": "application/json", ...corsHeaders },
+    return new Response(JSON.stringify(list), {
+      status: 200, headers: { "content-type": "application/json", ...allow(req) },
     });
   } catch (e: unknown) {
-    console.error("gc_institutions unhandled error", {
-      correlationId, message: errMessage(e), stack: errStack(e),
-    });
+    console.error("gc_institutions unhandled", { correlationId, message: errMessage(e) });
     return new Response(JSON.stringify({
       error: "Internal Server Error", code: "GC_INSTITUTIONS_FAILURE", correlationId,
-    }), { status: 500, headers: { "Content-Type": "application/json", ...corsHeaders } });
+      details: { message: errMessage(e) },
+    }), { status: 500, headers: { "content-type": "application/json", ...allow(req) } });
   }
 });
