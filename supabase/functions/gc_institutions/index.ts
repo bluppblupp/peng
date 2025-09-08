@@ -10,6 +10,7 @@ type Institution = { id: string; name: string };
 type Body = { country?: string };
 
 Deno.serve(async (req) => {
+  
   const correlationId = crypto.randomUUID();
 
   // ✅ req is in scope here
