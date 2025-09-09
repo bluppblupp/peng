@@ -1,20 +1,21 @@
 // supabase/functions/gc_sync/index.ts
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
-import { createClient } from "npm:@supabase/supabase-js@2.39.0";
+import { createClient, type SupabaseClient } from "npm:@supabase/supabase-js@2.39.0";
 import {
   allow, bearerFrom, errMessage,
   normalizeBase, nint,
-  newGcToken, gcFetchRaw, isRecord, getString, getNumber
+  newGcToken, gcFetchRaw, isRecord, getString, getNumber,
 } from "../_shared/gc.ts";
+import { categorize } from "../_shared/gc_categorize.ts";
 
-/** Incoming body */
+/** Request body coming from the client */
 type SyncReq = {
-  bank_account_id?: string;      // DB row id
-  date_from?: string;            // YYYY-MM-DD
-  date_to?: string;              // YYYY-MM-DD
+  bank_account_id?: string;
+  date_from?: string; // YYYY-MM-DD
+  date_to?: string;   // YYYY-MM-DD
 };
 
-/** BAD transaction subset */
+/** Subset of upstream BAD (GoCardless Bank Account Data) transaction fields we care about */
 type BadTx = {
   transactionId?: unknown;
   internalTransactionId?: unknown;
@@ -27,64 +28,109 @@ type BadTx = {
   remittanceInformationUnstructured?: unknown;
   remittanceInformationStructured?: unknown;
 };
+
 type BadTxPage = {
   transactions?: { booked?: unknown; pending?: unknown };
   next?: unknown;
 };
 
-/** Dates + deterministic id */
-function ymd(d: Date) { return d.toISOString().slice(0, 10); }
+/** Target DB row shape for public.transactions */
+type TxInsert = {
+  user_id: string;
+  bank_account_id: string;
+  transaction_id: string;
+  description: string;
+  amount: number;
+  category: string; // NOT NULL in DB
+  date: string;     // YYYY-MM-DD
+};
+
+/** Minimal bank_accounts row we read/write */
+type BankAccountRow = {
+  id: string;
+  user_id: string;
+  provider: string | null;
+  account_id: string | null;
+  last_sync_at: string | null;
+  next_allowed_sync_at: string | null;
+};
+
+/** Upsert .select("id") */
+type UpsertIdRow = { id: string };
+
+/** Utils */
+function ymd(d: Date): string {
+  return d.toISOString().slice(0, 10);
+}
+
 async function sha256Hex(s: string): Promise<string> {
   const buf = new TextEncoder().encode(s);
   const hash = await crypto.subtle.digest("SHA-256", buf);
-  const bytes = new Uint8Array(hash);
-  return Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("");
+  return Array.from(new Uint8Array(hash)).map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-/** Normalize BAD -> your columns */
+function parseRetryAfterSeconds(res: Response, bodyText: string): number | null {
+  const hdr = res.headers.get("Retry-After");
+  if (hdr) {
+    const sec = Number.parseInt(hdr, 10);
+    if (Number.isFinite(sec) && sec > 0) return sec;
+  }
+  const m = bodyText.match(/try again in\s+(\d+)\s+seconds/i);
+  if (m) {
+    const sec = Number.parseInt(m[1], 10);
+    if (Number.isFinite(sec) && sec > 0) return sec;
+  }
+  return null;
+}
+
+/** Normalize BAD -> our DB row (except user/bank ids) */
 async function normalizeTx(
   tx: BadTx,
   providerAccountId: string
-): Promise<{ transaction_id: string; description: string; amount: number; date: string; category: string | null; }> {
-  const txId = typeof tx.transactionId === "string" ? tx.transactionId : null;
+): Promise<{ transaction_id: string; description: string; counterparty: string; amount: number; date: string }> {
+  const txId  = typeof tx.transactionId === "string" ? tx.transactionId : null;
   const itxId = typeof tx.internalTransactionId === "string" ? tx.internalTransactionId : null;
-  const entryRef = typeof tx.entryReference === "string" ? tx.entryReference : null;
+  const refId = typeof tx.entryReference === "string" ? tx.entryReference : null;
 
-  let transaction_id = (txId || itxId || entryRef || "").trim();
-  if (!transaction_id) {
-    const amtObj = isRecord(tx.transactionAmount) ? tx.transactionAmount : null;
-    const amount = amtObj ? getNumber(amtObj, "amount") : null;
-    const currency = amtObj ? getString(amtObj, "currency") : null;
-    const hint = [
-      typeof tx.bookingDate === "string" ? tx.bookingDate : "",
-      amount !== null ? String(amount) : "",
-      currency ?? "",
-      typeof tx.remittanceInformationUnstructured === "string" ? tx.remittanceInformationUnstructured : "",
-    ].join("|");
-    transaction_id = await sha256Hex(providerAccountId + "|" + hint);
-  }
+  let transaction_id = (txId || itxId || refId || "").trim();
 
   const amtObj = isRecord(tx.transactionAmount) ? tx.transactionAmount : null;
   const amountNum = amtObj ? getNumber(amtObj, "amount") : null;
 
   const description =
     (typeof tx.remittanceInformationUnstructured === "string" && tx.remittanceInformationUnstructured) ||
-    (typeof tx.remittanceInformationStructured === "string" && tx.remittanceInformationStructured) ||
+    (typeof tx.remittanceInformationStructured   === "string" && tx.remittanceInformationStructured)   ||
     (typeof tx.creditorName === "string" && tx.creditorName) ||
-    (typeof tx.debtorName === "string" && tx.debtorName) ||
+    (typeof tx.debtorName   === "string" && tx.debtorName)   ||
     "Transaction";
+
+  const counterparty =
+    (typeof tx.creditorName === "string" && tx.creditorName) ||
+    (typeof tx.debtorName   === "string" && tx.debtorName) ||
+    "";
 
   const date =
     (typeof tx.bookingDate === "string" && tx.bookingDate) ||
-    (typeof tx.valueDate === "string" && tx.valueDate) ||
+    (typeof tx.valueDate   === "string" && tx.valueDate) ||
     ymd(new Date());
+
+  if (!transaction_id) {
+    const currency = amtObj ? getString(amtObj, "currency") : null;
+    const hint = [
+      typeof tx.bookingDate === "string" ? tx.bookingDate : "",
+      amountNum !== null ? String(amountNum) : "",
+      currency ?? "",
+      typeof tx.remittanceInformationUnstructured === "string" ? tx.remittanceInformationUnstructured : "",
+    ].join("|");
+    transaction_id = await sha256Hex(`${providerAccountId}|${hint}`);
+  }
 
   return {
     transaction_id,
     description,
+    counterparty,
     amount: amountNum !== null && Number.isFinite(amountNum) ? amountNum : 0,
     date,
-    category: null,
   };
 }
 
@@ -92,138 +138,239 @@ Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: allow(req) });
 
   const correlationId = crypto.randomUUID();
-  console.log("gc_sync start", {
-    method: req.method, ua: (req.headers.get("User-Agent") || "").slice(0, 60), correlationId,
-  });
 
   try {
     if (req.method !== "POST") {
-      return new Response(JSON.stringify({ error: "Method Not Allowed", code: "METHOD_NOT_ALLOWED", correlationId }), {
-        status: 405, headers: { "content-type": "application/json", ...allow(req) },
-      });
+      return new Response(
+        JSON.stringify({ error: "Method Not Allowed", code: "METHOD_NOT_ALLOWED", correlationId }),
+        { status: 405, headers: { "content-type": "application/json", ...allow(req) } }
+      );
     }
 
     // Env
     const rawEnv = Deno.env.toObject();
     let baseOk = true;
     try { new URL(rawEnv.GOCARDLESS_BASE_URL || ""); } catch { baseOk = false; }
-    if (!baseOk || !rawEnv.GOCARDLESS_SECRET_ID || !rawEnv.GOCARDLESS_SECRET_KEY || !rawEnv.SUPABASE_URL || !rawEnv.SUPABASE_ANON_KEY) {
-      console.error("gc_sync env missing/invalid", { correlationId });
-      return new Response(JSON.stringify({ error: "Internal Server Error", code: "CONFIG_MISSING", correlationId }), {
-        status: 500, headers: { "content-type": "application/json", ...allow(req) },
-      });
+    if (
+      !baseOk ||
+      !rawEnv.GOCARDLESS_SECRET_ID ||
+      !rawEnv.GOCARDLESS_SECRET_KEY ||
+      !rawEnv.SUPABASE_URL ||
+      !rawEnv.SUPABASE_ANON_KEY
+    ) {
+      return new Response(
+        JSON.stringify({ error: "Internal Server Error", code: "CONFIG_MISSING", correlationId }),
+        { status: 500, headers: { "content-type": "application/json", ...allow(req) } }
+      );
     }
+
     const env = {
       GOCARDLESS_BASE_URL: normalizeBase(rawEnv.GOCARDLESS_BASE_URL!),
       GOCARDLESS_SECRET_ID: rawEnv.GOCARDLESS_SECRET_ID!,
       GOCARDLESS_SECRET_KEY: rawEnv.GOCARDLESS_SECRET_KEY!,
       SUPABASE_URL: rawEnv.SUPABASE_URL!,
       SUPABASE_ANON_KEY: rawEnv.SUPABASE_ANON_KEY!,
-      TIMEOUT_TOKEN_MS: nint(rawEnv.GC_TIMEOUT_TOKEN_MS, 10_000),
-      TIMEOUT_ACCT_MS: nint(rawEnv.GC_TIMEOUT_ACCOUNT_MS, 10_000),
-      TIMEOUT_TX_MS: nint(rawEnv.GC_TIMEOUT_TX_MS, 20_000),
+      TIMEOUT_ACCT_MS:   nint(rawEnv.GC_TIMEOUT_ACCOUNT_MS, 10_000),
+      TIMEOUT_TX_MS:     nint(rawEnv.GC_TIMEOUT_TX_MS, 20_000),
       UPSERT_BATCH_SIZE: nint(rawEnv.GC_SYNC_BATCH_SIZE, 200),
+      DAYS_DEFAULT:      nint(rawEnv.GC_SYNC_DAYS, 30),
+      OVERLAP_DAYS:      nint(rawEnv.GC_SYNC_OVERLAP_DAYS, 2),
+      MAX_PAGES:         nint(rawEnv.GC_SYNC_MAX_PAGES, 12),
+      MIN_INTERVAL_MIN:  nint(rawEnv.GC_SYNC_MIN_INTERVAL_MINUTES, 180),
     };
 
     // Auth
     const supaJwt = bearerFrom(req);
-    const supa = createClient(env.SUPABASE_URL, env.SUPABASE_ANON_KEY, {
-      global: { headers: { Authorization: `Bearer ${supaJwt}` } }, auth: { persistSession: false },
+    const supa: SupabaseClient = createClient(env.SUPABASE_URL, env.SUPABASE_ANON_KEY, {
+      global: { headers: { Authorization: `Bearer ${supaJwt}` } },
+      auth: { persistSession: false },
     });
-    const { data: { user }, error: authError } = await supa.auth.getUser(supaJwt);
-    if (authError || !user) {
-      return new Response(JSON.stringify({ error: "Unauthorized", code: "AUTH_REQUIRED", correlationId }), {
-        status: 401, headers: { "content-type": "application/json", ...allow(req) },
-      });
+
+    const { data: userWrap, error: userErr } = await supa.auth.getUser(supaJwt);
+    if (userErr || !userWrap?.user) {
+      return new Response(
+        JSON.stringify({ error: "Unauthorized", code: "AUTH_REQUIRED", correlationId }),
+        { status: 401, headers: { "content-type": "application/json", ...allow(req) } }
+      );
     }
+    const userId = userWrap.user.id;
 
     // Body
     const raw = await req.text();
     let body: SyncReq | null = null;
     try { body = raw ? (JSON.parse(raw) as SyncReq) : null; } catch {
-      console.error("gc_sync invalid json", { correlationId, rawPreview: raw.slice(0, 120) });
-      return new Response(JSON.stringify({ error: "Bad Request", code: "INVALID_JSON", correlationId }), {
-        status: 400, headers: { "content-type": "application/json", ...allow(req) },
-      });
+      return new Response(
+        JSON.stringify({ error: "Bad Request", code: "INVALID_JSON", correlationId }),
+        { status: 400, headers: { "content-type": "application/json", ...allow(req) } }
+      );
     }
     const bankAccountRowId = (body?.bank_account_id || "").trim();
     if (!bankAccountRowId) {
-      return new Response(JSON.stringify({ error: "Bad Request", code: "MISSING_FIELDS", correlationId }), {
-        status: 400, headers: { "content-type": "application/json", ...allow(req) },
-      });
+      return new Response(
+        JSON.stringify({ error: "Bad Request", code: "MISSING_FIELDS", correlationId }),
+        { status: 400, headers: { "content-type": "application/json", ...allow(req) } }
+      );
     }
 
-    // DB lookup → provider account id
+    // Load account row (with cooldown fields)
     const { data: acctRow, error: acctErr } = await supa
       .from("bank_accounts")
-      .select("id, user_id, provider, account_id")
+      .select("id, user_id, provider, account_id, last_sync_at, next_allowed_sync_at")
       .eq("id", bankAccountRowId)
-      .eq("user_id", user.id)
-      .single();
+      .eq("user_id", userId)
+      .single<BankAccountRow>();
 
     if (acctErr || !acctRow) {
-      console.error("gc_sync bank account not found", { correlationId, bankAccountRowId, err: acctErr?.message });
-      return new Response(JSON.stringify({ error: "Not Found", code: "BANK_ACCOUNT_NOT_FOUND", correlationId }), {
-        status: 404, headers: { "content-type": "application/json", ...allow(req) },
-      });
+      return new Response(
+        JSON.stringify({ error: "Not Found", code: "BANK_ACCOUNT_NOT_FOUND", correlationId }),
+        { status: 404, headers: { "content-type": "application/json", ...allow(req) } }
+      );
     }
     if (acctRow.provider !== "gocardless") {
-      return new Response(JSON.stringify({ error: "Bad Request", code: "UNSUPPORTED_PROVIDER", correlationId }), {
-        status: 400, headers: { "content-type": "application/json", ...allow(req) },
-      });
+      return new Response(
+        JSON.stringify({ error: "Bad Request", code: "UNSUPPORTED_PROVIDER", correlationId }),
+        { status: 400, headers: { "content-type": "application/json", ...allow(req) } }
+      );
     }
     const providerAccountId = (acctRow.account_id || "").trim();
     if (!providerAccountId) {
-      return new Response(JSON.stringify({ error: "Bad Request", code: "ACCOUNT_MISSING_PROVIDER_ID", correlationId }), {
-        status: 400, headers: { "content-type": "application/json", ...allow(req) },
-      });
+      return new Response(
+        JSON.stringify({ error: "Bad Request", code: "ACCOUNT_MISSING_PROVIDER_ID", correlationId }),
+        { status: 400, headers: { "content-type": "application/json", ...allow(req) } }
+      );
     }
 
-    // BAD token + meta sanity
+    // Cooldown / freshness guards
+    const now = Date.now();
+    if (acctRow.next_allowed_sync_at) {
+      const nextMs = new Date(acctRow.next_allowed_sync_at).getTime();
+      if (Number.isFinite(nextMs) && now < nextMs) {
+        await supa
+          .from("bank_accounts")
+          .update({ last_sync_status: "noop-cooldown" })
+          .eq("id", bankAccountRowId)
+          .eq("user_id", userId);
+
+        return new Response(
+          JSON.stringify({
+            ok: true, noop: true, reason: "cooldown",
+            next_allowed_sync_at: acctRow.next_allowed_sync_at,
+            wait_seconds: Math.max(0, Math.ceil((nextMs - now) / 1000)),
+            correlationId,
+          }),
+          { status: 200, headers: { "content-type": "application/json", ...allow(req) } }
+        );
+      }
+    }
+    if (acctRow.last_sync_at) {
+      const age = now - new Date(acctRow.last_sync_at).getTime();
+      if (age >= 0 && age < env.MIN_INTERVAL_MIN * 60_000) {
+        await supa
+          .from("bank_accounts")
+          .update({ last_sync_status: "noop-fresh" })
+          .eq("id", bankAccountRowId)
+          .eq("user_id", userId);
+
+        return new Response(
+          JSON.stringify({
+            ok: true, noop: true, reason: "fresh",
+            last_sync_at: acctRow.last_sync_at,
+            min_interval_min: env.MIN_INTERVAL_MIN,
+            correlationId,
+          }),
+          { status: 200, headers: { "content-type": "application/json", ...allow(req) } }
+        );
+      }
+    }
+
+    // Upstream token & account meta sanity
     const tokenHolder = { token: await newGcToken(env, correlationId) };
     const refresh = (cid: string) => newGcToken(env, cid);
 
-    const metaRes = await gcFetchRaw(env, tokenHolder, `accounts/${encodeURIComponent(providerAccountId)}/`, { method: "GET" }, correlationId, env.TIMEOUT_ACCT_MS, refresh);
+    const metaRes = await gcFetchRaw(
+      env, tokenHolder,
+      `accounts/${encodeURIComponent(providerAccountId)}/`,
+      { method: "GET" },
+      correlationId, env.TIMEOUT_ACCT_MS, refresh
+    );
     if (!metaRes.ok) {
       const t = await metaRes.text().catch(() => "");
-      console.error("gc_sync upstream account meta error", { correlationId, status: metaRes.status, bodySnippet: t.slice(0, 400) });
       const code = metaRes.status === 401 ? "UPSTREAM_AUTH_INVALID" : "UPSTREAM_ACCOUNT_ERROR";
-      return new Response(JSON.stringify({ error: "Bad Gateway", code, correlationId }), {
-        status: 502, headers: { "content-type": "application/json", ...allow(req) },
-      });
+      return new Response(
+        JSON.stringify({ error: "Bad Gateway", code, correlationId, details: { status: metaRes.status, bodySnippet: t.slice(0, 600) } }),
+        { status: 502, headers: { "content-type": "application/json", ...allow(req) } }
+      );
     }
 
-    // Date range default 90 days
+    // Determine fetch window (default range with overlap behind last known tx)
     const today = new Date();
-    const from = body?.date_from ?? ymd(new Date(today.getTime() - 90 * 86400000));
+    const defaultFrom = ymd(new Date(today.getTime() - env.DAYS_DEFAULT * 86400000));
     const to = body?.date_to ?? ymd(today);
+    let from = body?.date_from ?? defaultFrom;
 
-    // Fetch & collect
-    let txUrl = `accounts/${encodeURIComponent(providerAccountId)}/transactions/?date_from=${encodeURIComponent(from)}&date_to=${encodeURIComponent(to)}`;
+    try {
+      const { data: last } = await supa
+        .from("transactions")
+        .select("date")
+        .eq("user_id", userId)
+        .eq("bank_account_id", bankAccountRowId)
+        .order("date", { ascending: false })
+        .limit(1)
+        .returns<{ date: string }[]>();
+
+      if (Array.isArray(last) && last.length > 0 && last[0]?.date) {
+        const lastDate = new Date(last[0].date);
+        const back = new Date(lastDate.getTime() - env.OVERLAP_DAYS * 86400000);
+        const overlapFrom = ymd(back);
+        if (!body?.date_from || overlapFrom < from) from = overlapFrom;
+      }
+    } catch {
+      // ignore
+    }
+
+    // Fetch transactions (paged)
     const collected: BadTx[] = [];
     let pages = 0;
+    let txUrl = `accounts/${encodeURIComponent(providerAccountId)}/transactions/?date_from=${encodeURIComponent(from)}&date_to=${encodeURIComponent(to)}`;
 
-    while (txUrl && pages < 20) {
+    while (txUrl && pages < env.MAX_PAGES) {
       const txRes = await gcFetchRaw(env, tokenHolder, txUrl, { method: "GET" }, correlationId, env.TIMEOUT_TX_MS, refresh);
       if (!txRes.ok) {
-        const t = await txRes.text().catch(() => "");
-        console.error("gc_sync upstream tx error", { correlationId, status: txRes.status, bodySnippet: t.slice(0, 450) });
+        const bodyText = await txRes.text().catch(() => "");
+        if (txRes.status === 429) {
+          const retrySec = parseRetryAfterSeconds(txRes, bodyText) ?? 3600;
+          await supa
+            .from("bank_accounts")
+            .update({
+              next_allowed_sync_at: new Date(Date.now() + retrySec * 1000).toISOString(),
+              last_sync_status: "rate_limited",
+            })
+            .eq("id", bankAccountRowId)
+            .eq("user_id", userId);
+
+          return new Response(
+            JSON.stringify({
+              error: "Rate limited", code: "UPSTREAM_RATE_LIMIT", correlationId,
+              details: { status: 429, retryAfterSeconds: retrySec, bodySnippet: bodyText.slice(0, 900) },
+            }),
+            { status: 429, headers: { "content-type": "application/json", "Retry-After": String(retrySec), ...allow(req) } }
+          );
+        }
         const code = txRes.status === 401 ? "UPSTREAM_AUTH_INVALID" : "UPSTREAM_TX_ERROR";
-        return new Response(JSON.stringify({ error: "Bad Gateway", code, correlationId }), {
-          status: 502, headers: { "content-type": "application/json", ...allow(req) },
-        });
+        return new Response(
+          JSON.stringify({ error: "Bad Gateway", code, correlationId, details: { status: txRes.status, bodySnippet: bodyText.slice(0, 900) } }),
+          { status: 502, headers: { "content-type": "application/json", ...allow(req) } }
+        );
       }
 
       const json = (await txRes.json().catch(() => ({}))) as BadTxPage;
       const txObj = isRecord(json.transactions) ? json.transactions : {};
       const bookedRaw = isRecord(txObj) && Array.isArray((txObj as Record<string, unknown>)["booked"])
-        ? ((txObj as Record<string, unknown>)["booked"] as unknown[])
-        : [];
+        ? ((txObj as Record<string, unknown>)["booked"] as unknown[]) : [];
       const pendingRaw = isRecord(txObj) && Array.isArray((txObj as Record<string, unknown>)["pending"])
-        ? ((txObj as Record<string, unknown>)["pending"] as unknown[])
-        : [];
+        ? ((txObj as Record<string, unknown>)["pending"] as unknown[]) : [];
 
-      for (const t of bookedRaw) if (isRecord(t)) collected.push(t as unknown as BadTx);
+      for (const t of bookedRaw)  if (isRecord(t)) collected.push(t as unknown as BadTx);
       for (const t of pendingRaw) if (isRecord(t)) collected.push(t as unknown as BadTx);
 
       const nextVal = isRecord(json) ? json.next : null;
@@ -231,55 +378,93 @@ Deno.serve(async (req) => {
       pages++;
     }
 
-    // Normalize -> rows
-    const rows: Array<Record<string, unknown>> = [];
+    // Map -> rows (categorize via shared gc_categorize)
+    const rows: TxInsert[] = [];
     for (const t of collected) {
       const n = await normalizeTx(t, providerAccountId);
+
+      // Shared categorizer (safe fallback to "uncategorized")
+      let category = "uncategorized";
+      try {
+        const out = categorize({ description: n.description, counterparty: n.counterparty });
+        if (out && typeof out.category === "string" && out.category.trim()) {
+          category = out.category.trim();
+        }
+      } catch {
+        // keep default
+      }
+
       rows.push({
-        user_id: user.id,
+        user_id: userId,
         bank_account_id: acctRow.id,
         transaction_id: n.transaction_id,
         description: n.description,
         amount: n.amount,
-        category: n.category,
+        category,
         date: n.date,
       });
     }
 
-    // Upsert (needs unique index on (user_id, bank_account_id, transaction_id))
-    let affected = 0;
+    // Upsert batched
+    let upserted = 0;
     if (rows.length > 0) {
       const size = Math.max(1, Math.min(env.UPSERT_BATCH_SIZE ?? 200, 500));
       for (let i = 0; i < rows.length; i += size) {
-        const chunk = rows.slice(i, i + size);
+        const chunk: ReadonlyArray<TxInsert> = rows.slice(i, i + size);
         const { data, error } = await supa
           .from("transactions")
-          .upsert(chunk, { onConflict: "user_id,bank_account_id,transaction_id" })
-          .select("id");
+          .upsert(chunk as TxInsert[], { onConflict: "user_id,bank_account_id,transaction_id" })
+          .select("id")
+          .returns<UpsertIdRow[]>();
+
         if (error) {
-          console.error("gc_sync upsert error", { correlationId, i, size: chunk.length, error: String(error.message || error) });
-          return new Response(JSON.stringify({ error: "Database Error", code: "DB_UPSERT_FAILED", correlationId }), {
-            status: 500, headers: { "content-type": "application/json", ...allow(req) },
-          });
+          return new Response(
+            JSON.stringify({
+              error: "Database Error", code: "DB_UPSERT_FAILED", correlationId,
+              details: { message: String(error.message || error) },
+            }),
+            { status: 500, headers: { "content-type": "application/json", ...allow(req) } }
+          );
         }
-        affected += Array.isArray(data) ? data.length : 0;
+        upserted += Array.isArray(data) ? data.length : 0;
       }
     }
 
-    console.log("gc_sync success", {
-      correlationId, userId: user.id, bankAccountRowId, providerAccountId, pages,
-      fetched: collected.length, upserted: affected,
-    });
+    // Mark account as synced and set next allowed time
+    const nextAllowed = new Date(Date.now() + env.MIN_INTERVAL_MIN * 60_000).toISOString();
+    const statusNote = upserted === 0 ? "ok:0" : "ok";
+    await supa
+      .from("bank_accounts")
+      .update({
+        last_sync_at: new Date().toISOString(),
+        next_allowed_sync_at: nextAllowed,
+        last_sync_status: statusNote,
+      })
+      .eq("id", bankAccountRowId)
+      .eq("user_id", userId);
 
-    return new Response(JSON.stringify({
-      ok: true, bank_account_id: bankAccountRowId,
-      date_from: from, date_to: to, fetched: collected.length, upserted: affected,
-    }), { status: 200, headers: { "content-type": "application/json", ...allow(req) } });
+    return new Response(
+      JSON.stringify({
+        ok: true,
+        noop: false,
+        bank_account_id: bankAccountRowId,
+        fetched: collected.length,
+        upserted,
+        next_allowed_sync_at: nextAllowed,
+        correlationId,
+      }),
+      { status: 200, headers: { "content-type": "application/json", ...allow(req) } }
+    );
+
   } catch (e: unknown) {
-    console.error("gc_sync unhandled error", { correlationId, message: errMessage(e) });
-    return new Response(JSON.stringify({
-      error: "Internal Server Error", code: "GC_SYNC_FAILURE", correlationId,
-      details: { message: errMessage(e) },
-    }), { status: 500, headers: { "content-type": "application/json", ...allow(req) } });
+    return new Response(
+      JSON.stringify({
+        error: "Internal Server Error",
+        code: "GC_SYNC_FAILURE",
+        correlationId,
+        details: { message: errMessage(e) },
+      }),
+      { status: 500, headers: { "content-type": "application/json", ...allow(req) } }
+    );
   }
 });
