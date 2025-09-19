@@ -2,7 +2,7 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 
 /** CORS (lenient; tighten Origin in prod) */
-export const allow = (req: Request) => ({
+export const allow = (req: Request): Record<string, string> => ({
   "access-control-allow-origin": "*",
   "access-control-allow-headers":
     req.headers.get("access-control-request-headers") ??
@@ -18,7 +18,15 @@ export const bearerFrom = (req: Request): string => {
 };
 
 export const errMessage = (e: unknown): string =>
-  e instanceof Error ? e.message : (() => { try { return typeof e === "string" ? e : JSON.stringify(e); } catch { return String(e); } })();
+  e instanceof Error
+    ? e.message
+    : (() => {
+        try {
+          return typeof e === "string" ? e : JSON.stringify(e);
+        } catch {
+          return String(e);
+        }
+      })();
 
 export function normalizeBase(input: string): string {
   const base = (input || "").trim().replace(/\/+$/, "");
@@ -26,19 +34,26 @@ export function normalizeBase(input: string): string {
   if (/\/api$/i.test(base)) return base + "/v2";
   return base + "/api/v2";
 }
+
 export function joinUrl(base: string, path: string): string {
   const b = base.endsWith("/") ? base : base + "/";
   const p = path.startsWith("/") ? path.slice(1) : path;
   return b + p;
 }
+
 export function nint(v: string | undefined, def: number): number {
-  const n = v ? parseInt(v, 10) : NaN;
+  const n = v ? Number.parseInt(v, 10) : Number.NaN;
   return Number.isFinite(n) && n > 0 ? n : def;
 }
 
 /** Timed fetch */
-const DEFAULT_TIMEOUT_MS = 15000;
-export async function fetchTimed(url: string, init?: RequestInit, ms = DEFAULT_TIMEOUT_MS): Promise<Response> {
+const DEFAULT_TIMEOUT_MS = 15_000;
+
+export async function fetchTimed(
+  url: string,
+  init?: RequestInit,
+  ms: number = DEFAULT_TIMEOUT_MS
+): Promise<Response> {
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), ms);
   try {
@@ -52,11 +67,13 @@ export async function fetchTimed(url: string, init?: RequestInit, ms = DEFAULT_T
 export function isRecord(x: unknown): x is Record<string, unknown> {
   return typeof x === "object" && x !== null;
 }
+
 export function getString(o: unknown, key: string): string | null {
   if (!isRecord(o)) return null;
   const v = o[key];
   return typeof v === "string" ? v : null;
 }
+
 export function getNumber(o: unknown, key: string): number | null {
   if (!isRecord(o)) return null;
   const v = o[key];
@@ -67,6 +84,15 @@ export function getNumber(o: unknown, key: string): number | null {
   }
   return null;
 }
+export function getStringArray(o: unknown, key: string): string[] | null {
+  if (!isRecord(o)) return null;
+  const v = o[key];
+  if (!Array.isArray(v)) return null;
+  const out: string[] = [];
+  for (const item of v) if (typeof item === "string" && item.trim()) out.push(item.trim());
+  return out.length ? out : null;
+}
+
 
 /** Env + token + upstream */
 export type Env = {
@@ -75,7 +101,11 @@ export type Env = {
   GOCARDLESS_SECRET_KEY: string;
   SUPABASE_URL: string;
   SUPABASE_ANON_KEY: string;
-  TIMEOUT_TOKEN_MS: number;
+
+  /** Optional: if unset, we fall back to DEFAULT_TIMEOUT_MS */
+  TIMEOUT_TOKEN_MS?: number;
+
+  /** Optional knobs used by callers */
   TIMEOUT_EUA_MS?: number;
   TIMEOUT_REQUISITION_MS?: number;
   TIMEOUT_ACCT_MS?: number;
@@ -84,16 +114,21 @@ export type Env = {
 
 export type TokenHolder = { token: string };
 
+/** Acquire short-lived GoCardless token (with safe timeout fallback) */
 export async function newGcToken(env: Env, correlationId: string): Promise<string> {
   const res = await fetchTimed(
     joinUrl(env.GOCARDLESS_BASE_URL, "token/new/"),
     {
       method: "POST",
       headers: { "Content-Type": "application/json", Accept: "application/json" },
-      body: JSON.stringify({ secret_id: env.GOCARDLESS_SECRET_ID, secret_key: env.GOCARDLESS_SECRET_KEY }),
+      body: JSON.stringify({
+        secret_id: env.GOCARDLESS_SECRET_ID,
+        secret_key: env.GOCARDLESS_SECRET_KEY,
+      }),
     },
-    env.TIMEOUT_TOKEN_MS
+    env.TIMEOUT_TOKEN_MS ?? DEFAULT_TIMEOUT_MS
   );
+
   if (!res.ok) {
     const t = await res.text().catch(() => "");
     throw new Error(`GC_TOKEN_ERROR ${res.status} ${t.slice(0, 300)} (${correlationId})`);
@@ -102,6 +137,17 @@ export async function newGcToken(env: Env, correlationId: string): Promise<strin
   const access = getString(json, "access");
   if (!access) throw new Error(`GC_TOKEN_MALFORMED (${correlationId})`);
   return access;
+}
+
+/** Merge headers robustly across Headers/arrays/plain objects */
+function mergeHeaders(...parts: (HeadersInit | undefined)[]): Headers {
+  const h = new Headers();
+  for (const p of parts) {
+    if (!p) continue;
+    const iter = new Headers(p);
+    iter.forEach((value, key) => h.set(key, value));
+  }
+  return h;
 }
 
 /**
@@ -120,17 +166,25 @@ export async function gcFetchRaw(
   tokenRefresh: (cid: string) => Promise<string>
 ): Promise<Response> {
   const url = /^https?:\/\//i.test(path) ? path : joinUrl(env.GOCARDLESS_BASE_URL, path);
-  const doFetch = async () =>
-    fetchTimed(url, {
-      ...init,
-      headers: { Accept: "application/json", ...(init.headers || {}), Authorization: `Bearer ${tokenHolder.token}` },
-    }, timeoutMs);
+
+  const doFetch = async (): Promise<Response> => {
+    const headers = mergeHeaders(
+      { Accept: "application/json" },
+      init.headers,
+      { Authorization: `Bearer ${tokenHolder.token}` }
+    );
+    return fetchTimed(url, { ...init, headers }, timeoutMs ?? DEFAULT_TIMEOUT_MS);
+  };
 
   let res = await doFetch();
   if (res.ok) return res;
 
   if (res.status === 401) {
-    try { tokenHolder.token = await tokenRefresh(correlationId); } catch { return res; }
+    try {
+      tokenHolder.token = await tokenRefresh(correlationId);
+    } catch {
+      return res; // bubble original 401
+    }
     res = await doFetch();
     if (res.ok) return res;
   }
@@ -141,5 +195,6 @@ export async function gcFetchRaw(
     await new Promise((r) => setTimeout(r, waitMs));
     res = await doFetch();
   }
+
   return res;
 }

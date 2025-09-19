@@ -8,10 +8,10 @@ import { useCurrency } from "@/contexts/CurrencyContext";
 
 type TxRow = {
   id: string;
-  date: string;                 // stored as date in DB; supabase returns ISO-ish string
+  date: string;                 // date in DB; Supabase returns ISO-like string
   description: string | null;
-  amount: number;
-  category: string;             // NOT NULL in your schema; defaults to "uncategorized"
+  amount: string | number;      // numeric may come back as string
+  category: string;
   bank_account_id: string;
 };
 
@@ -19,9 +19,9 @@ type AccountRow = { id: string; name: string | null };
 
 type UiTx = {
   id: string;
-  date: string;                 // ISO (safe to pass to Date)
+  date: string;                 // ISO string
   description: string;
-  amount: number;
+  amount: number;               // normalized to number for display
   bank_account_id: string;
   account_name: string | null;
   category: string;
@@ -44,10 +44,9 @@ export function TransactionList() {
       setLoading(false);
       return;
     }
-
     setLoading(true);
 
-    // 1) Check if user has any connected banks (controls the empty-state message)
+    // 1) Has any bank?
     const { data: banks } = await supabase
       .from("connected_banks")
       .select("id")
@@ -56,14 +55,13 @@ export function TransactionList() {
 
     setHasAnyBank((banks?.length ?? 0) > 0);
 
-    // 2) Fetch transactions (compact selection — no missing columns)
-    const txQuery = supabase
+    // 2) Transactions
+    const { data: txData, error: txError } = await supabase
       .from("transactions")
       .select("id, date, description, amount, category, bank_account_id")
       .eq("user_id", user.id)
-      .order("date", { ascending: false });
-
-    const { data: txData, error: txError } = await txQuery.returns<TxRow[]>();
+      .order("date", { ascending: false })
+      .returns<TxRow[]>();
 
     if (txError || !txData) {
       if (txError) console.error("Failed to load transactions", txError);
@@ -73,45 +71,43 @@ export function TransactionList() {
       return;
     }
 
-    // 3) Load account names for labels (typed)
+    // 3) Account names
     const accountIds = Array.from(new Set(txData.map((tx) => tx.bank_account_id)));
     let accMap = new Map<string, string | null>();
     if (accountIds.length > 0) {
-      const accQuery = supabase
+      const { data: accounts, error: accErr } = await supabase
         .from("bank_accounts")
         .select("id, name")
-        .in("id", accountIds);
-
-      const { data: accounts, error: accErr } = await accQuery.returns<AccountRow[]>();
+        .in("id", accountIds)
+        .returns<AccountRow[]>();
       if (accErr) console.error("Failed to load accounts", accErr);
       accMap = new Map((accounts ?? []).map((a) => [a.id, a.name]));
     }
 
-    // 4) Map DB rows → UI rows (compact)
-    const ui: UiTx[] = txData.map((tx) => ({
-      id: tx.id,
-      date: tx.date ? new Date(tx.date).toISOString() : new Date().toISOString(),
-      description: (tx.description ?? "").trim() || "Transaction",
-      amount: typeof tx.amount === "number" ? tx.amount : Number(tx.amount ?? 0),
-      bank_account_id: tx.bank_account_id,
-      account_name: accMap.get(tx.bank_account_id) ?? null,
-      category: (tx.category ?? "").trim() || "uncategorized",
-    }));
+    // 4) Map to UI
+    const ui: UiTx[] = txData.map((tx) => {
+      const amt = typeof tx.amount === "number" ? tx.amount : Number(tx.amount ?? 0);
+      return {
+        id: tx.id,
+        date: tx.date ? new Date(tx.date).toISOString() : new Date().toISOString(),
+        description: (tx.description ?? "").trim() || "Transaction",
+        amount: Number.isFinite(amt) ? amt : 0,
+        bank_account_id: tx.bank_account_id,
+        account_name: accMap.get(tx.bank_account_id) ?? null,
+        category: (tx.category ?? "").trim() || "Other",
+      };
+    });
 
     setTransactions(ui);
     setAccountsById(accMap);
     setLoading(false);
   }, [user]);
 
-  // initial + on auth change
-  useEffect(() => {
-    // eslint-disable-next-line @typescript-eslint/no-floating-promises
-    load();
-  }, [load]);
+  useEffect(() => { void load(); }, [load]);
 
   // refetch when sync completes (ConnectedBanksCard dispatches peng:tx:updated)
   useEffect(() => {
-    const handler = () => { /* eslint-disable-next-line @typescript-eslint/no-floating-promises */ load(); };
+    const handler = () => { void load(); };
     window.addEventListener("peng:tx:updated", handler as EventListener);
     return () => window.removeEventListener("peng:tx:updated", handler as EventListener);
   }, [load]);
@@ -146,7 +142,7 @@ export function TransactionList() {
                 <span>{new Date(tx.date).toLocaleDateString()}</span>
                 <span>•</span>
                 <span className="truncate">{tx.account_name || "Account"}</span>
-                {tx.category && tx.category !== "uncategorized" && (
+                {tx.category && tx.category !== "Other" && (
                   <>
                     <span>•</span>
                     <Badge variant="secondary" className="h-5 text-[10px]">

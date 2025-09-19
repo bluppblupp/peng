@@ -1,73 +1,148 @@
+// supabase/functions/gc_complete/index.ts
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
-
-/** CORS */
-function allow(req: Request) {
-  const origin = req.headers.get("Origin") ?? "*";
-  const acrh =
-    req.headers.get("Access-Control-Request-Headers") ??
-    "authorization, x-client-info, x-supabase-api-version, apikey, content-type";
-  const acrm = req.headers.get("Access-Control-Request-Method") ?? "POST, OPTIONS";
-  return {
-    "Access-Control-Allow-Origin": origin === "null" ? "*" : origin,
-    "Access-Control-Allow-Headers": acrh,
-    "Access-Control-Allow-Methods": acrm,
-    "Access-Control-Max-Age": "86400",
-    Vary: "Origin, Access-Control-Request-Method, Access-Control-Request-Headers",
-  };
-}
-function safeMsg(e: unknown): string {
-  if (e instanceof Error) return e.message;
-  try { return typeof e === "string" ? e : JSON.stringify(e); } catch { return String(e); }
-}
-function isRecord(x: unknown): x is Record<string, unknown> {
-  return !!x && typeof x === "object" && !Array.isArray(x);
-}
-function getString(r: Record<string, unknown>, k: string): string | null {
-  return typeof r[k] === "string" ? (r[k] as string) : null;
-}
+import { createClient } from "npm:@supabase/supabase-js@2.39.0";
+import {
+  allow,
+  bearerFrom,
+  errMessage,
+  normalizeBase,
+  nint,
+  newGcToken,
+  gcFetchRaw,
+  isRecord,
+  getString,
+} from "../_shared/gc.ts";
 
 type CompleteBody = { requisition_id?: string; reference?: string };
-type RequisitionItem = {
+
+type GcRequisition = {
   id?: string;
   reference?: string;
-  institution_id?: string;
   status?: string;
   accounts?: unknown;
 };
 
-Deno.serve(async (req) => {
-  if (req.method === "OPTIONS") return new Response("ok", { headers: allow(req) });
+type GcAccountMeta = {
+  account?: unknown;
+  iban?: unknown;
+  resourceId?: unknown;
+  currency?: unknown;
+  name?: unknown;
+  product?: unknown;
+};
 
+type BankAccountInsert = {
+  user_id: string;
+  connected_bank_id: string;
+  provider: "gocardless";
+  institution_id: string;
+  account_id: string;
+  name: string | null;
+  iban: string | null;
+  currency: string | null;
+  type: string | null;
+};
+
+type UpsertIdRow = { id: string };
+
+function safeStr(v: unknown): string | null {
+  return typeof v === "string" && v.trim() ? v.trim() : null;
+}
+
+async function fetchRequisitionRobust(
+  env: { GOCARDLESS_BASE_URL: string },
+  tokenHolder: { token: string },
+  correlationId: string,
+  timeoutMs: number,
+  refresh: (cid: string) => Promise<string>,
+  requisitionId?: string | null,
+  reference?: string | null
+): Promise<GcRequisition | null> {
+  // 1) Try by id
+  if (requisitionId) {
+    const res = await gcFetchRaw(
+      env, tokenHolder,
+      `requisitions/${encodeURIComponent(requisitionId)}/`,
+      { method: "GET" },
+      correlationId, timeoutMs, refresh
+    );
+    if (res.ok) return (await res.json().catch(() => ({}))) as GcRequisition;
+
+    if (res.status !== 404) {
+      const t = await res.text().catch(() => "");
+      throw new Response(
+        JSON.stringify({
+          error: "Bad Gateway",
+          code: "UPSTREAM_REQUISITION_ERROR",
+          correlationId,
+          details: { status: res.status, bodySnippet: t.slice(0, 900) },
+        }),
+        { status: 502, headers: { "content-type": "application/json" } }
+      );
+    }
+    // fall through on 404
+  }
+
+  // 2) Try by listing and matching reference
+  if (reference) {
+    const list = await gcFetchRaw(
+      env, tokenHolder,
+      "requisitions/",
+      { method: "GET" },
+      correlationId, timeoutMs, refresh
+    );
+    if (!list.ok) {
+      const t = await list.text().catch(() => "");
+      throw new Response(
+        JSON.stringify({
+          error: "Bad Gateway",
+          code: "UPSTREAM_REQUISITION_LIST_ERROR",
+          correlationId,
+          details: { status: list.status, bodySnippet: t.slice(0, 900) },
+        }),
+        { status: 502, headers: { "content-type": "application/json" } }
+      );
+    }
+    const json = (await list.json().catch(() => ({}))) as { results?: GcRequisition[] };
+    const match = Array.isArray(json?.results)
+      ? json.results!.find(r => (r.reference || "").trim() === reference.trim())
+      : undefined;
+    if (match) return match;
+  }
+
+  return null;
+}
+
+Deno.serve(async (req) => {
   const correlationId = crypto.randomUUID();
-  console.log("gc_complete start", {
-    method: req.method,
-    ua: (req.headers.get("User-Agent") || "").slice(0, 60),
-    correlationId,
-  });
+
+  if (req.method === "OPTIONS") return new Response("ok", { headers: allow(req) });
 
   try {
     if (req.method !== "POST") {
-      return new Response(JSON.stringify({ error: "Method Not Allowed", code: "METHOD_NOT_ALLOWED", correlationId }), {
-        status: 405, headers: { "content-type": "application/json", ...allow(req) },
-      });
+      return new Response(
+        JSON.stringify({ error: "Method Not Allowed", code: "METHOD_NOT_ALLOWED", correlationId }),
+        { status: 405, headers: { "content-type": "application/json", ...allow(req) } },
+      );
     }
 
-    // Defer heavy imports
-    const { createClient } = await import("npm:@supabase/supabase-js@2.39.0");
-    const shared = await import("../_shared/gc.ts");
-    const {
-      bearerFrom, normalizeBase, nint, newGcToken, gcFetchRaw,
-    } = shared;
-
-    // Env
+    // ---- Env
     const rawEnv = Deno.env.toObject();
     let baseOk = true;
     try { new URL(rawEnv.GOCARDLESS_BASE_URL || ""); } catch { baseOk = false; }
-    if (!baseOk || !rawEnv.GOCARDLESS_SECRET_ID || !rawEnv.GOCARDLESS_SECRET_KEY || !rawEnv.SUPABASE_URL || !rawEnv.SUPABASE_ANON_KEY) {
-      return new Response(JSON.stringify({ error: "Internal Server Error", code: "CONFIG_MISSING", correlationId }), {
-        status: 500, headers: { "content-type": "application/json", ...allow(req) },
-      });
+    if (
+      !baseOk ||
+      !rawEnv.GOCARDLESS_SECRET_ID ||
+      !rawEnv.GOCARDLESS_SECRET_KEY ||
+      !rawEnv.SUPABASE_URL ||
+      !rawEnv.SUPABASE_ANON_KEY
+    ) {
+      return new Response(
+        JSON.stringify({ error: "Internal Server Error", code: "CONFIG_MISSING", correlationId }),
+        { status: 500, headers: { "content-type": "application/json", ...allow(req) } },
+      );
     }
+
     const env = {
       GOCARDLESS_BASE_URL: normalizeBase(rawEnv.GOCARDLESS_BASE_URL!),
       GOCARDLESS_SECRET_ID: rawEnv.GOCARDLESS_SECRET_ID!,
@@ -78,229 +153,260 @@ Deno.serve(async (req) => {
       TIMEOUT_ACCOUNT_MS: nint(rawEnv.GC_TIMEOUT_ACCOUNT_MS, 10_000),
     };
 
-    // Auth
+    // ---- Auth (caller’s JWT so RLS applies)
     const token = bearerFrom(req);
     const supa = createClient(env.SUPABASE_URL, env.SUPABASE_ANON_KEY, {
-      global: { headers: { Authorization: `Bearer ${token}` } },
+      global: { headers: { Authorization: token ? `Bearer ${token}` : "" } },
       auth: { persistSession: false },
     });
-    const { data: { user } } = await supa.auth.getUser(token);
-    if (!user) {
-      return new Response(JSON.stringify({ error: "Unauthorized", code: "AUTH_REQUIRED", correlationId }), {
-        status: 401, headers: { "content-type": "application/json", ...allow(req) },
-      });
+    const { data: { user }, error: authError } = await supa.auth.getUser(token);
+    if (authError || !user) {
+      return new Response(
+        JSON.stringify({ error: "Unauthorized", code: "AUTH_REQUIRED", correlationId }),
+        { status: 401, headers: { "content-type": "application/json", ...allow(req) } },
+      );
     }
 
-    // Body
+    // ---- Body
     const raw = await req.text();
     let body: CompleteBody | null = null;
     try { body = raw ? (JSON.parse(raw) as CompleteBody) : null; } catch {
-      return new Response(JSON.stringify({ error: "Bad Request", code: "INVALID_JSON", correlationId }), {
-        status: 400, headers: { "content-type": "application/json", ...allow(req) },
-      });
+      return new Response(
+        JSON.stringify({ error: "Bad Request", code: "INVALID_JSON", correlationId }),
+        { status: 400, headers: { "content-type": "application/json", ...allow(req) } },
+      );
     }
-    let requisitionId = (body?.requisition_id || "").trim();
-    const reference = (body?.reference || "").trim();
-    if (!requisitionId && !reference) {
-      return new Response(JSON.stringify({ error: "Bad Request", code: "MISSING_FIELDS", correlationId }), {
-        status: 400, headers: { "content-type": "application/json", ...allow(req) },
-      });
+    const requestedId = (body?.requisition_id || "").trim() || null;
+    const requestedRef = (body?.reference || "").trim() || null;
+    if (!requestedId && !requestedRef) {
+      return new Response(
+        JSON.stringify({ error: "Bad Request", code: "MISSING_FIELDS", correlationId }),
+        { status: 400, headers: { "content-type": "application/json", ...allow(req) } },
+      );
     }
 
-    // GC token
+    // ---- BAD token
     const tokenHolder = { token: await newGcToken(env, correlationId) };
     const refresh = (cid: string) => newGcToken(env, cid);
 
-    // Resolve requisition by reference if needed (page up to 5)
-    let requisitionFromList: RequisitionItem | null = null;
-    if (!requisitionId && reference) {
-      let nextUrl: string | null = "requisitions/";
-      let pages = 0;
-      while (nextUrl && pages < 5) {
-        const listRes = await gcFetchRaw(env, tokenHolder, nextUrl, { method: "GET" }, correlationId, 12_000, refresh);
-        if (!listRes.ok) break;
-        const json = (await listRes.json().catch(() => ({}))) as { results?: RequisitionItem[]; next?: string | null } | RequisitionItem[];
-        const items: RequisitionItem[] = Array.isArray(json)
-          ? json as RequisitionItem[]
-          : Array.isArray(json.results) ? json.results as RequisitionItem[] : [];
-        const found = items.find((it) => typeof it.reference === "string" && it.reference === reference);
-        if (found && typeof found.id === "string") {
-          requisitionId = found.id;
-          requisitionFromList = found;
-          break;
-        }
-        const nextLink = Array.isArray(json) ? null : (typeof json.next === "string" ? json.next : null);
-        nextUrl = nextLink ? nextLink : null;
-        pages++;
-      }
-      if (!requisitionId) {
-        return new Response(JSON.stringify({
-          error: "Not Found", code: "UNKNOWN_REQUISITION_BY_REF", correlationId, details: { reference },
-        }), { status: 404, headers: { "content-type": "application/json", ...allow(req) } });
-      }
-    }
-
-    // Fetch requisition details
-    const rqRes = await gcFetchRaw(env, tokenHolder, `requisitions/${encodeURIComponent(requisitionId)}/`, { method: "GET" }, correlationId, env.TIMEOUT_REQUISITION_MS, refresh);
-    if (!rqRes.ok) {
-      const text = await rqRes.text().catch(() => "");
-      console.error("gc_complete upstream requisition error", { correlationId, status: rqRes.status, bodySnippet: text.slice(0, 400) });
-      return new Response(JSON.stringify({
-        error: "Bad Gateway", code: "UPSTREAM_REQUISITION_ERROR", correlationId,
-        details: { status: rqRes.status, bodySnippet: text.slice(0, 400) }
-      }), { status: 502, headers: { "content-type": "application/json", ...allow(req) } });
-    }
-
-    const rqJson = (await rqRes.json().catch(() => ({}))) as RequisitionItem & Record<string, unknown>;
-    const statusStr = typeof rqJson.status === "string" ? rqJson.status : "";
-    const accounts = Array.isArray(rqJson.accounts) ? (rqJson.accounts as unknown[]).map(String) : [];
-    const institutionId = typeof rqJson.institution_id === "string"
-      ? rqJson.institution_id
-      : (typeof requisitionFromList?.institution_id === "string" ? requisitionFromList.institution_id! : "");
-
-    // Ensure connected_banks row exists (by link_id = requisitionId)
-    const { data: bankRow } = await supa
-      .from("connected_banks")
-      .select("id, institution_id, bank_name")
-      .eq("link_id", requisitionId)
-      .eq("user_id", user.id)
-      .single();
-
-    let connectedBankId = bankRow?.id ?? "";
-    if (!connectedBankId) {
-      const { data: inserted, error: insErr } = await supa
-        .from("connected_banks")
-        .upsert(
-          {
-            user_id: user.id,
-            bank_name: bankRow?.bank_name ?? "Bank",
-            account_id: requisitionId, // placeholder unique per user
-            institution_id: institutionId || bankRow?.institution_id || null,
-            is_active: true,
-            provider: "gocardless",
-            link_id: requisitionId,
-            country: "SE",
-            status: statusStr || "pending",
-          },
-          { onConflict: "user_id,account_id" }
-        )
-        .select("id")
-        .single();
-
-      if (insErr || !inserted?.id) {
-        return new Response(JSON.stringify({
-          error: "Database Error", code: "DB_REPAIR_FAILED", correlationId
-        }), { status: 500, headers: { "content-type": "application/json", ...allow(req) } });
-      }
-      connectedBankId = inserted.id;
-    }
-
-    // Update status (best effort)
-    await supa
-      .from("connected_banks")
-      .update({
-        status: accounts.length > 0 ? (statusStr || "active") : (statusStr || "pending"),
-        consent_expires_at: new Date(Date.now() + 180 * 24 * 3600 * 1000).toISOString(),
-      })
-      .eq("id", connectedBankId)
-      .eq("user_id", user.id);
-
-    // Not linked / expired
-    if (accounts.length === 0) {
-      const looksExpired =
-        statusStr.toLowerCase().includes("expire") ||
-        (typeof (rqJson as Record<string, unknown>).detail === "string" &&
-          ((rqJson as Record<string, unknown>).detail as string).toLowerCase().includes("expire"));
-
-      return new Response(JSON.stringify({
-        error: "Requisition not linked",
-        code: looksExpired ? "REQUISITION_EXPIRED" : "REQUISITION_NOT_LINKED",
-        correlationId,
-        details: { status: statusStr || "unknown", institution_id: institutionId || null, bank_name: bankRow?.bank_name || null },
-      }), { status: 409, headers: { "content-type": "application/json", ...allow(req) } });
-    }
-
-    // Fetch account meta/details & upsert bank_accounts
-    const metas = await Promise.all(
-      accounts.map(async (id) => {
-        const metaRes = await gcFetchRaw(env, tokenHolder, `accounts/${encodeURIComponent(id)}/`, { method: "GET" }, correlationId, env.TIMEOUT_ACCOUNT_MS, refresh);
-        if (!metaRes.ok) {
-          const body = await metaRes.text().catch(() => "");
-          throw new Error(`GC_ACCOUNT_META ${metaRes.status} ${body.slice(0, 300)}`);
-        }
-        const detRes = await gcFetchRaw(env, tokenHolder, `accounts/${encodeURIComponent(id)}/details/`, { method: "GET" }, correlationId, env.TIMEOUT_ACCOUNT_MS, refresh);
-        if (!detRes.ok) {
-          const body = await detRes.text().catch(() => "");
-          throw new Error(`GC_ACCOUNT_DETAILS ${detRes.status} ${body.slice(0, 300)}`);
-        }
-
-        const meta = (await metaRes.json().catch(() => ({}))) as Record<string, unknown>;
-        const details = (await detRes.json().catch(() => ({}))) as Record<string, unknown>;
-
-        const dAcc = (details.account as Record<string, unknown> | undefined) ?? {};
-        const mAcc = (meta.account as Record<string, unknown> | undefined) ?? {};
-
-        const name =
-          (typeof dAcc.name === "string" && dAcc.name) ||
-          (typeof mAcc.name === "string" && mAcc.name) ||
-          (typeof (dAcc as Record<string, unknown>).displayName === "string" &&
-            ((dAcc as Record<string, unknown>).displayName as string)) ||
-          "Account";
-
-        const iban =
-          (typeof dAcc.iban === "string" && dAcc.iban) ||
-          (typeof mAcc.iban === "string" && mAcc.iban) ||
-          null;
-
-        const currency =
-          (typeof dAcc.currency === "string" && dAcc.currency) ||
-          (typeof mAcc.currency === "string" && mAcc.currency) ||
-          null;
-
-        const type =
-          (typeof dAcc.type === "string" && dAcc.type) ||
-          (typeof mAcc.product === "string" && mAcc.product) ||
-          null;
-
-        const { data: row, error } = await supa
-          .from("bank_accounts")
-          .upsert(
-            {
-              user_id: user.id,
-              connected_bank_id: connectedBankId,
-              provider: "gocardless",
-              institution_id: institutionId || null,
-              account_id: id,
-              name, iban, currency, type,
-              is_selected: false,
-            },
-            { onConflict: "user_id,provider,account_id" }
-          )
-          .select("id")
-          .single();
-
-        if (error) throw new Error(`DB upsert failed: ${error.message}`);
-
-        return { id, name, currency, iban, type, row_id: row?.id };
-      })
+    // ---- Fetch requisition (robust: id then list-by-reference)
+    const requisition = await fetchRequisitionRobust(
+      env,
+      tokenHolder,
+      correlationId,
+      env.TIMEOUT_REQUISITION_MS!,
+      refresh,
+      requestedId,
+      requestedRef
     );
 
-    console.log("gc_complete success", {
-      correlationId, userId: user.id, connectedBankId, accounts: metas.length,
-      warnings: 0,
-    });
+    if (!requisition?.id) {
+      return new Response(
+        JSON.stringify({
+          error: "Not Found",
+          code: "REQUISITION_NOT_FOUND",
+          correlationId,
+          details: { requestedId, requestedRef },
+        }),
+        { status: 404, headers: { "content-type": "application/json", ...allow(req) } },
+      );
+    }
 
-    return new Response(JSON.stringify({ accounts: metas }), {
-      status: 200,
-      headers: { "content-type": "application/json", ...allow(req) },
-    });
+    const reqId = requisition.id;
+
+    // Extract upstream account ids from requisition
+    const accountsVal = isRecord(requisition) ? (requisition as Record<string, unknown>).accounts : null;
+    const accountIds = Array.isArray(accountsVal)
+      ? (accountsVal as unknown[]).map((v) => (typeof v === "string" ? v : null)).filter((v): v is string => v !== null)
+      : [];
+
+    // ---- Lookup connected_banks by link_id (reqId first, then reference)
+    let connectedBankId: string | null = null;
+    let institutionId: string | null = null;
+
+    {
+      const tryKeys: string[] = [reqId, requestedRef ?? ""].filter((k) => k.length > 0);
+      for (const key of tryKeys) {
+        const { data, error } = await supa
+          .from("connected_banks")
+          .select("id, institution_id")
+          .eq("user_id", user.id)
+          .eq("link_id", key)
+          .limit(1)
+          .maybeSingle();
+
+        if (!error && data?.id) {
+          connectedBankId = data.id;
+          institutionId = data.institution_id;
+          break;
+        }
+      }
+    }
+
+    if (!connectedBankId) {
+      // Create a stub if the create step didn't persist (shouldn’t usually happen)
+      const insertRes = await supa
+        .from("connected_banks")
+        .insert({
+          user_id: user.id,
+          bank_name: "Bank",
+          account_id: reqId,
+          institution_id: "unknown",
+          is_active: true,
+          provider: "gocardless",
+          link_id: reqId,
+          country: "SE",
+          status: "pending",
+        })
+        .select("id, institution_id")
+        .single();
+
+      if (insertRes.error || !insertRes.data?.id) {
+        return new Response(
+          JSON.stringify({
+            error: "Database Error",
+            code: "DB_STUB_FAILED",
+            correlationId,
+            details: { message: insertRes.error?.message || "failed to create connected_banks stub" },
+          }),
+          { status: 500, headers: { "content-type": "application/json", ...allow(req) } },
+        );
+      }
+      connectedBankId = insertRes.data.id;
+      institutionId = insertRes.data.institution_id;
+    }
+
+    // ---- Fetch each account meta and upsert bank_accounts
+    const inserts: BankAccountInsert[] = [];
+    for (const accId of accountIds) {
+      const metaRes = await gcFetchRaw(
+        env,
+        tokenHolder,
+        `accounts/${encodeURIComponent(accId)}/`,
+        { method: "GET" },
+        correlationId,
+        env.TIMEOUT_ACCOUNT_MS!,
+        refresh
+      );
+      if (!metaRes.ok) {
+        const t = await metaRes.text().catch(() => "");
+        return new Response(
+          JSON.stringify({
+            error: "Bad Gateway",
+            code: "UPSTREAM_ACCOUNT_ERROR",
+            correlationId,
+            details: { status: metaRes.status, bodySnippet: t.slice(0, 900) },
+          }),
+          { status: 502, headers: { "content-type": "application/json", ...allow(req) } },
+        );
+      }
+
+      const meta = (await metaRes.json().catch(() => ({}))) as GcAccountMeta;
+      const acctObj = isRecord(meta.account) ? (meta.account as Record<string, unknown>) : {};
+      const metaObj = isRecord(meta) ? (meta as Record<string, unknown>) : {};
+
+      const name =
+        getString(acctObj, "name") ??
+        getString(metaObj, "name") ??
+        "Account";
+
+      const currency =
+        getString(acctObj, "currency") ??
+        getString(metaObj, "currency") ??
+        null;
+
+      const iban =
+        getString(acctObj, "iban") ??
+        getString(metaObj, "iban") ??
+        null;
+
+      const type =
+        getString(acctObj, "product") ??
+        getString(metaObj, "product") ??
+        null;
+
+      inserts.push({
+        user_id: user.id,
+        connected_bank_id: connectedBankId!,
+        provider: "gocardless",
+        institution_id: institutionId || "unknown",
+        account_id: accId,
+        name,
+        iban,
+        currency,
+        type,
+      });
+    }
+
+    let accountRowIds: string[] = [];
+    if (inserts.length > 0) {
+      // De-dupe by (user_id, provider, institution_id, account_id)
+      const uniq = new Map<string, BankAccountInsert>();
+      for (const r of inserts) {
+        const k = `${r.user_id}|${r.provider}|${r.institution_id}|${r.account_id}`;
+        if (!uniq.has(k)) uniq.set(k, r);
+      }
+      const deduped = Array.from(uniq.values());
+
+      const { data, error } = await supa
+        .from("bank_accounts")
+        .upsert(deduped as BankAccountInsert[], {
+          onConflict: "user_id,provider,institution_id,account_id",
+        })
+        .select("id")
+        .returns<UpsertIdRow[]>();
+
+      if (error) {
+        return new Response(
+          JSON.stringify({
+            error: "Database Error",
+            code: "DB_UPSERT_FAILED",
+            correlationId,
+            details: {
+              message: error.message,
+              code: error.code,
+              details: error.details,
+              hint: error.hint,
+            },
+          }),
+          { status: 500, headers: { "content-type": "application/json", ...allow(req) } },
+        );
+      }
+      accountRowIds = Array.isArray(data) ? data.map((r) => r.id) : [];
+    }
+
+    // ---- Mark bank active
+    await supa
+      .from("connected_banks")
+      .update({ status: "active", is_active: true })
+      .eq("id", connectedBankId!)
+      .eq("user_id", user.id);
+
+    // ---- Response (callback expects accounts w/ row_id)
+    return new Response(
+      JSON.stringify({
+        ok: true,
+        requisition_id: reqId,
+        accounts: accountRowIds.map((row_id, i) => ({
+          id: accountIds[i] ?? "",
+          row_id,
+          name: inserts[i]?.name ?? "Account",
+          currency: inserts[i]?.currency ?? null,
+          iban: inserts[i]?.iban ?? null,
+          type: inserts[i]?.type ?? null,
+        })),
+      }),
+      { status: 200, headers: { "content-type": "application/json", ...allow(req) } },
+    );
   } catch (e: unknown) {
-    console.error("gc_complete unhandled error", { correlationId, message: safeMsg(e) });
-    return new Response(JSON.stringify({
-      error: "Internal Server Error",
-      code: "GC_COMPLETE_FAILURE",
-      correlationId,
-      details: { message: safeMsg(e) },
-    }), { status: 500, headers: { "content-type": "application/json", ...allow(req) } });
+    return new Response(
+      JSON.stringify({
+        error: "Internal Server Error",
+        code: "GC_COMPLETE_FAILURE",
+        correlationId,
+        details: { message: errMessage(e) },
+      }),
+      { status: 500, headers: { "content-type": "application/json", ...allow(req) } },
+    );
   }
 });

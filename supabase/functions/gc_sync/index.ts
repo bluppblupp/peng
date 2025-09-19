@@ -4,29 +4,41 @@ import { createClient, type SupabaseClient } from "npm:@supabase/supabase-js@2.3
 import {
   allow, bearerFrom, errMessage,
   normalizeBase, nint,
-  newGcToken, gcFetchRaw, isRecord, getString, getNumber,
+  newGcToken, gcFetchRaw, isRecord, getString, getNumber, getStringArray,
 } from "../_shared/gc.ts";
-import { categorize } from "../_shared/gc_categorize.ts";
 
 /** Request body coming from the client */
 type SyncReq = {
   bank_account_id?: string;
   date_from?: string; // YYYY-MM-DD
   date_to?: string;   // YYYY-MM-DD
+  /** dev/test only: bypass local cooldown/fresh checks if caller is allow-listed */
+  force?: boolean;
 };
 
-/** Subset of upstream BAD (GoCardless Bank Account Data) transaction fields we care about */
+/** Subset of upstream BAD fields we care about */
 type BadTx = {
   transactionId?: unknown;
   internalTransactionId?: unknown;
   entryReference?: unknown;
+
   bookingDate?: unknown;
   valueDate?: unknown;
-  transactionAmount?: unknown;
+
+  transactionAmount?: unknown; // { amount, currency }
+  creditDebitIndicator?: unknown; // 'DBIT' | 'CRDT' | string
+
   creditorName?: unknown;
   debtorName?: unknown;
+
   remittanceInformationUnstructured?: unknown;
   remittanceInformationStructured?: unknown;
+  remittanceInformationUnstructuredArray?: unknown;
+
+  additionalInformation?: unknown;
+
+  bankTransactionCode?: unknown;
+  proprietaryBankTransactionCode?: unknown;
 };
 
 type BadTxPage = {
@@ -34,15 +46,16 @@ type BadTxPage = {
   next?: unknown;
 };
 
-/** Target DB row shape for public.transactions */
+/** What we actually insert (let DB defaults/triggers handle category) */
 type TxInsert = {
   user_id: string;
   bank_account_id: string;
   transaction_id: string;
   description: string;
-  amount: number;
-  category: string; // NOT NULL in DB
-  date: string;     // YYYY-MM-DD
+  amount: number;     // signed (DBIT negative, CRDT positive)
+  date: string;       // YYYY-MM-DD
+  merchant_name?: string | null;
+  merchant_key?: string | null;
 };
 
 /** Minimal bank_accounts row we read/write */
@@ -83,11 +96,35 @@ function parseRetryAfterSeconds(res: Response, bodyText: string): number | null 
   return null;
 }
 
-/** Normalize BAD -> our DB row (except user/bank ids) */
+type NormalizedTx = {
+  transaction_id: string;
+  description: string;
+  amount: number; // signed
+  date: string;   // YYYY-MM-DD
+  merchant_name: string | null;
+  merchant_key: string | null;
+};
+
+/** Pick the best text from candidates */
+function firstNonEmpty(...cands: Array<string | null | undefined>): string | null {
+  for (const c of cands) {
+    const v = (c ?? "").trim();
+    if (v) return v;
+  }
+  return null;
+}
+
+function normalizeMerchantKey(name: string | null): string | null {
+  if (!name) return null;
+  const key = name.toLowerCase().normalize("NFKD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9]+/g, " ").trim().replace(/\s+/g, " ");
+  return key || null;
+}
+
+/** Normalize BAD -> our DB row (signed amount, robust description/merchant) */
 async function normalizeTx(
   tx: BadTx,
   providerAccountId: string
-): Promise<{ transaction_id: string; description: string; counterparty: string; amount: number; date: string }> {
+): Promise<NormalizedTx> {
   const txId  = typeof tx.transactionId === "string" ? tx.transactionId : null;
   const itxId = typeof tx.internalTransactionId === "string" ? tx.internalTransactionId : null;
   const refId = typeof tx.entryReference === "string" ? tx.entryReference : null;
@@ -95,43 +132,61 @@ async function normalizeTx(
   let transaction_id = (txId || itxId || refId || "").trim();
 
   const amtObj = isRecord(tx.transactionAmount) ? tx.transactionAmount : null;
-  const amountNum = amtObj ? getNumber(amtObj, "amount") : null;
+  const amountParsed = amtObj ? getNumber(amtObj, "amount") : null;
 
+  const indicatorRaw = typeof tx.creditDebitIndicator === "string" ? tx.creditDebitIndicator.trim().toUpperCase() : "";
+  const indicator = indicatorRaw === "DBIT" || indicatorRaw === "CRDT" ? indicatorRaw : "";
+
+  // Resolve description: prefer remittance array → unstructured → structured → additional → entryRef → counterparty → fallback
+  const riuArray = getStringArray(tx, "remittanceInformationUnstructuredArray");
+  const riu = typeof tx.remittanceInformationUnstructured === "string" ? tx.remittanceInformationUnstructured : null;
+  const ris = typeof tx.remittanceInformationStructured === "string" ? tx.remittanceInformationStructured : null;
+  const addInfo = typeof tx.additionalInformation === "string" ? tx.additionalInformation : null;
+
+  const creditor = typeof tx.creditorName === "string" ? tx.creditorName : null;
+  const debtor   = typeof tx.debtorName   === "string" ? tx.debtorName   : null;
+
+  const descFromArray = riuArray ? riuArray.join(" ").trim() : "";
   const description =
-    (typeof tx.remittanceInformationUnstructured === "string" && tx.remittanceInformationUnstructured) ||
-    (typeof tx.remittanceInformationStructured   === "string" && tx.remittanceInformationStructured)   ||
-    (typeof tx.creditorName === "string" && tx.creditorName) ||
-    (typeof tx.debtorName   === "string" && tx.debtorName)   ||
-    "Transaction";
+    firstNonEmpty(descFromArray, riu, ris, addInfo, refId, creditor, debtor, "Transaction")!;
 
-  const counterparty =
-    (typeof tx.creditorName === "string" && tx.creditorName) ||
-    (typeof tx.debtorName   === "string" && tx.debtorName) ||
-    "";
+  // Prefer a counterparty as merchant; pick the one not equal to desc if possible
+  const prefMerchant = firstNonEmpty(creditor !== description ? creditor : null, debtor !== description ? debtor : null, creditor, debtor);
+  const merchant_name = prefMerchant ?? null;
+  const merchant_key  = normalizeMerchantKey(merchant_name);
 
+  // Dates
   const date =
     (typeof tx.bookingDate === "string" && tx.bookingDate) ||
     (typeof tx.valueDate   === "string" && tx.valueDate) ||
     ymd(new Date());
 
+  // Transaction ID fallback if none
   if (!transaction_id) {
     const currency = amtObj ? getString(amtObj, "currency") : null;
     const hint = [
       typeof tx.bookingDate === "string" ? tx.bookingDate : "",
-      amountNum !== null ? String(amountNum) : "",
+      amountParsed !== null ? String(amountParsed) : "",
       currency ?? "",
-      typeof tx.remittanceInformationUnstructured === "string" ? tx.remittanceInformationUnstructured : "",
+      description,
     ].join("|");
     transaction_id = await sha256Hex(`${providerAccountId}|${hint}`);
   }
 
-  return {
-    transaction_id,
-    description,
-    counterparty,
-    amount: amountNum !== null && Number.isFinite(amountNum) ? amountNum : 0,
-    date,
-  };
+  // Amount sign:
+  // - if upstream already signed (amountParsed < 0), keep it
+  // - else apply indicator: DBIT -> negative, CRDT -> positive
+  // - fallback: 0 if missing
+  let amount = 0;
+  if (amountParsed !== null) {
+    if (amountParsed < 0) {
+      amount = amountParsed;
+    } else {
+      amount = indicator === "DBIT" ? -Math.abs(amountParsed) : Math.abs(amountParsed);
+    }
+  }
+
+  return { transaction_id, description: description.trim(), amount, date, merchant_name, merchant_key };
 }
 
 Deno.serve(async (req) => {
@@ -177,6 +232,8 @@ Deno.serve(async (req) => {
       OVERLAP_DAYS:      nint(rawEnv.GC_SYNC_OVERLAP_DAYS, 2),
       MAX_PAGES:         nint(rawEnv.GC_SYNC_MAX_PAGES, 12),
       MIN_INTERVAL_MIN:  nint(rawEnv.GC_SYNC_MIN_INTERVAL_MINUTES, 180),
+      DEV_FORCE_UIDS:    (rawEnv.GC_DEV_FORCE_UIDS || "").split(",").map((s) => s.trim()).filter(Boolean),
+      DEBUG:             (rawEnv.GC_SYNC_DEBUG || "").toLowerCase() === "true" || rawEnv.GC_SYNC_DEBUG === "1",
     };
 
     // Auth
@@ -212,7 +269,11 @@ Deno.serve(async (req) => {
       );
     }
 
-    // Load account row (with cooldown fields)
+    // Force?
+    const requestedForce = !!body?.force;
+    const allowForce = requestedForce && env.DEV_FORCE_UIDS.includes(userId);
+
+    // Load account
     const { data: acctRow, error: acctErr } = await supa
       .from("bank_accounts")
       .select("id, user_id, provider, account_id, last_sync_at, next_allowed_sync_at")
@@ -240,13 +301,12 @@ Deno.serve(async (req) => {
       );
     }
 
-    // Cooldown / freshness guards
+    // Cooldown / freshness guards (skipped if allowForce)
     const now = Date.now();
-    if (acctRow.next_allowed_sync_at) {
+    if (!allowForce && acctRow.next_allowed_sync_at) {
       const nextMs = new Date(acctRow.next_allowed_sync_at).getTime();
       if (Number.isFinite(nextMs) && now < nextMs) {
-        await supa
-          .from("bank_accounts")
+        await supa.from("bank_accounts")
           .update({ last_sync_status: "noop-cooldown" })
           .eq("id", bankAccountRowId)
           .eq("user_id", userId);
@@ -262,11 +322,10 @@ Deno.serve(async (req) => {
         );
       }
     }
-    if (acctRow.last_sync_at) {
+    if (!allowForce && acctRow.last_sync_at) {
       const age = now - new Date(acctRow.last_sync_at).getTime();
       if (age >= 0 && age < env.MIN_INTERVAL_MIN * 60_000) {
-        await supa
-          .from("bank_accounts")
+        await supa.from("bank_accounts")
           .update({ last_sync_status: "noop-fresh" })
           .eq("id", bankAccountRowId)
           .eq("user_id", userId);
@@ -283,7 +342,7 @@ Deno.serve(async (req) => {
       }
     }
 
-    // Upstream token & account meta sanity
+    // Upstream token & account sanity
     const tokenHolder = { token: await newGcToken(env, correlationId) };
     const refresh = (cid: string) => newGcToken(env, cid);
 
@@ -291,7 +350,7 @@ Deno.serve(async (req) => {
       env, tokenHolder,
       `accounts/${encodeURIComponent(providerAccountId)}/`,
       { method: "GET" },
-      correlationId, env.TIMEOUT_ACCT_MS, refresh
+      correlationId, env.TIMEOUT_ACCT_MS ?? 10_000, refresh
     );
     if (!metaRes.ok) {
       const t = await metaRes.text().catch(() => "");
@@ -302,9 +361,9 @@ Deno.serve(async (req) => {
       );
     }
 
-    // Determine fetch window (default range with overlap behind last known tx)
+    // Determine fetch window
     const today = new Date();
-    const defaultFrom = ymd(new Date(today.getTime() - env.DAYS_DEFAULT * 86400000));
+    const defaultFrom = ymd(new Date(today.getTime() - (nint(rawEnv.GC_SYNC_DAYS, 30)) * 86400000));
     const to = body?.date_to ?? ymd(today);
     let from = body?.date_from ?? defaultFrom;
 
@@ -320,12 +379,12 @@ Deno.serve(async (req) => {
 
       if (Array.isArray(last) && last.length > 0 && last[0]?.date) {
         const lastDate = new Date(last[0].date);
-        const back = new Date(lastDate.getTime() - env.OVERLAP_DAYS * 86400000);
+        const back = new Date(lastDate.getTime() - (nint(rawEnv.GC_SYNC_OVERLAP_DAYS, 2)) * 86400000);
         const overlapFrom = ymd(back);
         if (!body?.date_from || overlapFrom < from) from = overlapFrom;
       }
     } catch {
-      // ignore
+      /* ignore */
     }
 
     // Fetch transactions (paged)
@@ -333,8 +392,8 @@ Deno.serve(async (req) => {
     let pages = 0;
     let txUrl = `accounts/${encodeURIComponent(providerAccountId)}/transactions/?date_from=${encodeURIComponent(from)}&date_to=${encodeURIComponent(to)}`;
 
-    while (txUrl && pages < env.MAX_PAGES) {
-      const txRes = await gcFetchRaw(env, tokenHolder, txUrl, { method: "GET" }, correlationId, env.TIMEOUT_TX_MS, refresh);
+    while (txUrl && pages < nint(rawEnv.GC_SYNC_MAX_PAGES, 12)) {
+      const txRes = await gcFetchRaw(env, tokenHolder, txUrl, { method: "GET" }, correlationId, env.TIMEOUT_TX_MS ?? 20_000, refresh);
       if (!txRes.ok) {
         const bodyText = await txRes.text().catch(() => "");
         if (txRes.status === 429) {
@@ -378,37 +437,40 @@ Deno.serve(async (req) => {
       pages++;
     }
 
-    // Map -> rows (categorize via shared gc_categorize)
-    const rows: TxInsert[] = [];
-    for (const t of collected) {
-      const n = await normalizeTx(t, providerAccountId);
+    // Map -> rows (no category set; let DB default/trigger handle it)
+    const normalized: NormalizedTx[] = [];
+    for (const t of collected) normalized.push(await normalizeTx(t, providerAccountId));
 
-      // Shared categorizer (safe fallback to "uncategorized")
-      let category = "uncategorized";
-      try {
-        const out = categorize({ description: n.description, counterparty: n.counterparty });
-        if (out && typeof out.category === "string" && out.category.trim()) {
-          category = out.category.trim();
-        }
-      } catch {
-        // keep default
-      }
+    // De-duplicate by the upsert key: user_id + bank_account_id + transaction_id
+    const uniq = new Map<string, NormalizedTx>();
+    for (const n of normalized) {
+      const k = `${userId}|${acctRow.id}|${n.transaction_id}`;
+      if (!uniq.has(k)) uniq.set(k, n);
+    }
+    const deduped = Array.from(uniq.values());
 
-      rows.push({
-        user_id: userId,
-        bank_account_id: acctRow.id,
-        transaction_id: n.transaction_id,
-        description: n.description,
-        amount: n.amount,
-        category,
-        date: n.date,
-      });
+    const rows: TxInsert[] = deduped.map((n) => ({
+      user_id: userId,
+      bank_account_id: acctRow.id,
+      transaction_id: n.transaction_id,
+      description: n.description,
+      amount: n.amount,
+      date: n.date,
+      merchant_name: n.merchant_name,
+      merchant_key: n.merchant_key,
+    }));
+
+    if (rawEnv.GC_SYNC_DEBUG === "1" || rawEnv.GC_SYNC_DEBUG?.toLowerCase() === "true") {
+      console.log(
+        `gc_sync sample ${correlationId} ${rows.length} rows`,
+        JSON.stringify(rows.slice(0, 5), null, 2)
+      );
     }
 
     // Upsert batched
     let upserted = 0;
     if (rows.length > 0) {
-      const size = Math.max(1, Math.min(env.UPSERT_BATCH_SIZE ?? 200, 500));
+      const size = Math.max(1, Math.min(nint(rawEnv.GC_SYNC_BATCH_SIZE, 200), 500));
       for (let i = 0; i < rows.length; i += size) {
         const chunk: ReadonlyArray<TxInsert> = rows.slice(i, i + size);
         const { data, error } = await supa
@@ -431,7 +493,7 @@ Deno.serve(async (req) => {
     }
 
     // Mark account as synced and set next allowed time
-    const nextAllowed = new Date(Date.now() + env.MIN_INTERVAL_MIN * 60_000).toISOString();
+    const nextAllowed = new Date(Date.now() + nint(rawEnv.GC_SYNC_MIN_INTERVAL_MINUTES, 180) * 60_000).toISOString();
     const statusNote = upserted === 0 ? "ok:0" : "ok";
     await supa
       .from("bank_accounts")

@@ -1,3 +1,4 @@
+// src/components/bank/BankConnection.tsx
 import { useEffect, useMemo, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Loader2, Plus } from "lucide-react";
@@ -25,6 +26,31 @@ type Props = {
   /** compact = tight inline layout (no card/borders) */
   mode?: "full" | "compact";
 };
+
+type FunctionErrorJson = {
+  error?: string;
+  code?: string;
+  correlationId?: string;
+  details?: Record<string, unknown>;
+};
+
+function isResponse(x: unknown): x is Response {
+  return typeof Response !== "undefined" && x instanceof Response;
+}
+
+/** Parse Supabase FunctionsHttpError to our server's JSON payload */
+async function parseFunctionError(err: unknown): Promise<FunctionErrorJson | null> {
+  const maybe = err as { context?: unknown } | null;
+  if (maybe?.context && isResponse(maybe.context)) {
+    try {
+      const json = (await maybe.context.clone().json()) as unknown;
+      if (json && typeof json === "object") return json as FunctionErrorJson;
+    } catch {
+      /* ignore */
+    }
+  }
+  return null;
+}
 
 export function BankConnection({ mode = "compact" }: Props) {
   const { toast } = useToast();
@@ -76,8 +102,7 @@ export function BankConnection({ mode = "compact" }: Props) {
   const containerCls = useMemo(
     () =>
       mode === "compact"
-        ? // inline, tight, *fixed widths on sm+*, full width only on xs
-          "flex flex-wrap items-end gap-3"
+        ? "flex flex-wrap items-end gap-3"
         : "grid grid-cols-1 sm:grid-cols-[minmax(0,180px)_minmax(0,280px)_auto] gap-3 items-end",
     [mode]
   );
@@ -93,7 +118,7 @@ export function BankConnection({ mode = "compact" }: Props) {
     }
     setConnectLoading(true);
     try {
-      const redirectUrl = `${location.origin}/banks/callback`;
+      const redirectUrl = `${location.origin}/banks/callback`; // must be whitelisted in GoCardless/Nordigen
       const bank = banks.find((b) => b.id === selectedBank);
       const res = await supabase.functions.invoke<{ link?: string }>("gc_create_requisition", {
         body: { institution_id: selectedBank, redirect_url: redirectUrl, bank_name: bank?.name ?? "Bank" },
@@ -102,12 +127,43 @@ export function BankConnection({ mode = "compact" }: Props) {
       if (!res.data?.link) throw new Error("Did not receive GoCardless link.");
       window.location.href = res.data.link;
     } catch (e: unknown) {
-      console.error("Create requisition failed:", e);
-      toast({
-        title: "Unable to start connection",
-        description: e instanceof Error ? e.message : String(e),
-        variant: "destructive",
-      });
+      const parsed = await parseFunctionError(e);
+      const code = parsed?.code ?? "";
+      const cid = parsed?.correlationId ? ` · ${parsed.correlationId}` : "";
+
+      if (code === "UPSTREAM_INSTITUTION_DOWN") {
+        const summary = (parsed?.details?.summary as string | undefined) ?? "This bank is temporarily unavailable.";
+        toast({
+          title: "Bank unavailable",
+          description: `${summary} Please try again later or choose another bank.`,
+          variant: "destructive",
+        });
+      } else if (code === "DB_UPSERT_FAILED") {
+        toast({
+          title: "Database error",
+          description: `Could not save connection on the server${cid}. Check the unique index & RLS on 'connected_banks'.`,
+          variant: "destructive",
+        });
+      } else if (code === "CONFIG_MISSING") {
+        toast({
+          title: "Server misconfigured",
+          description: `Missing env vars on the function${cid}.`,
+          variant: "destructive",
+        });
+      } else if (code) {
+        toast({
+          title: "Unable to start connection",
+          description: `${parsed?.error ?? "Function failed"} (${code}${cid})`,
+          variant: "destructive",
+        });
+      } else {
+        console.error("Create requisition failed:", e);
+        toast({
+          title: "Unable to start connection",
+          description: e instanceof Error ? e.message : String(e),
+          variant: "destructive",
+        });
+      }
     } finally {
       setConnectLoading(false);
     }
