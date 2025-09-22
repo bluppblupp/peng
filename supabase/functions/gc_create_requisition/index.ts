@@ -17,10 +17,13 @@ type CreateBody = {
   institution_id?: string;
   redirect_url?: string;
   bank_name?: string;
+  country?: string; // optional; defaults to 'SE' if omitted
 };
 
+/** Row id shape for select-after-upsert */
 type RowId = { id: string };
 
+/** Required env config (no any) */
 type Env = {
   GOCARDLESS_BASE_URL: string;
   GOCARDLESS_SECRET_ID: string;
@@ -36,7 +39,6 @@ function jsonHeaders(req: Request): HeadersInit {
 }
 
 function parseUpstreamDown(bodyText: string): { summary?: string } {
-  // Try to extract a brief explanation from upstream error JSON text
   try {
     const obj = JSON.parse(bodyText) as Record<string, unknown>;
     const summary = typeof obj.summary === "string" ? obj.summary : undefined;
@@ -49,7 +51,9 @@ function parseUpstreamDown(bodyText: string): { summary?: string } {
 Deno.serve(async (req: Request) => {
   const correlationId = crypto.randomUUID();
 
-  if (req.method === "OPTIONS") return new Response("ok", { headers: allow(req) });
+  if (req.method === "OPTIONS") {
+    return new Response("ok", { headers: allow(req) });
+  }
 
   console.log(
     "gc_create_requisition start",
@@ -73,7 +77,6 @@ Deno.serve(async (req: Request) => {
     const rawEnv = Deno.env.toObject();
     let baseOk = true;
     try {
-      // Validate base URL shape
       new URL(rawEnv.GOCARDLESS_BASE_URL || "");
     } catch {
       baseOk = false;
@@ -103,13 +106,13 @@ Deno.serve(async (req: Request) => {
     };
 
     // ---- Auth
-    const token = bearerFrom(req);
+    const jwt = bearerFrom(req);
     const supa: SupabaseClient = createClient(env.SUPABASE_URL, env.SUPABASE_ANON_KEY, {
-      global: { headers: { Authorization: token ? `Bearer ${token}` : "" } },
+      global: { headers: { Authorization: jwt ? `Bearer ${jwt}` : "" } },
       auth: { persistSession: false },
     });
 
-    const userWrap = await supa.auth.getUser(token);
+    const userWrap = await supa.auth.getUser(jwt);
     if (userWrap.error || !userWrap.data?.user) {
       return new Response(
         JSON.stringify({ error: "Unauthorized", code: "AUTH_REQUIRED", correlationId }),
@@ -133,6 +136,7 @@ Deno.serve(async (req: Request) => {
     const institution_id = (body?.institution_id || "").trim();
     const redirect_url = (body?.redirect_url || "").trim();
     const bank_name = (body?.bank_name || "Bank").trim();
+    const country = (body?.country || "SE").trim().toUpperCase();
 
     if (!institution_id || !redirect_url) {
       return new Response(
@@ -145,7 +149,7 @@ Deno.serve(async (req: Request) => {
     const tokenHolder = { token: await newGcToken(env, correlationId) };
     const refresh = (cid: string) => newGcToken(env, cid);
 
-    // ---- Create End-User Agreement (include institution_id)
+    // ---- Create End-User Agreement (requires institution_id)
     const euaRes = await gcFetchRaw(
       env,
       tokenHolder,
@@ -154,7 +158,7 @@ Deno.serve(async (req: Request) => {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          institution_id, // required
+          institution_id,
           max_historical_days: 365,
           access_valid_for_days: 180,
           access_scope: ["balances", "details", "transactions"],
@@ -167,7 +171,6 @@ Deno.serve(async (req: Request) => {
 
     if (!euaRes.ok) {
       const t = await euaRes.text().catch(() => "");
-      // Map 503 to a friendlier code so UI can show "bank down"
       if (euaRes.status === 503) {
         const { summary } = parseUpstreamDown(t);
         console.error(
@@ -184,7 +187,6 @@ Deno.serve(async (req: Request) => {
           { status: 502, headers: jsonHeaders(req) },
         );
       }
-
       console.error(
         "gc_create_requisition upstream eua error",
         JSON.stringify({ correlationId, status: euaRes.status, bodySnippet: t.slice(0, 400) }),
@@ -247,7 +249,6 @@ Deno.serve(async (req: Request) => {
           { status: 502, headers: jsonHeaders(req) },
         );
       }
-
       console.error(
         "gc_create_requisition upstream requisition error",
         JSON.stringify({ correlationId, status: rqRes.status, bodySnippet: t.slice(0, 400) }),
@@ -273,24 +274,26 @@ Deno.serve(async (req: Request) => {
       );
     }
 
-    // ---- DB upsert: connected_banks on (user_id, link_id)
-    //     Note: account_id gets the requisitionId placeholder; real account id arrives on completion.
+    // ---- DB upsert: connected_banks on (user_id, provider, link_id)
+    // NOTE:
+    //  - account_id is NOT known yet; real account rows are created in gc_complete.
+    //  - If your schema still requires NOT NULL account_id, either relax it (recommended) or
+    //    set a placeholder here (e.g., requisitionId). Code below assumes account_id is nullable.
+    const upsertPayload = {
+      user_id: userId,
+      provider: "gocardless",
+      link_id: requisitionId,  // conflict key member
+      status: "pending" as const,
+      bank_name,
+      country,
+      institution_id,
+      is_active: true,
+      // account_id: requisitionId, // <- ONLY if your column is NOT NULL (otherwise leave commented)
+    };
+
     const { data: upData, error: upErr } = await supa
       .from("connected_banks")
-      .upsert(
-        {
-          user_id: userId,
-          bank_name,
-          account_id: requisitionId, // placeholder
-          institution_id,
-          is_active: true,
-          provider: "gocardless",
-          link_id: requisitionId, // conflict key
-          country: "SE",
-          status: "pending",
-        },
-        { onConflict: "user_id,link_id" },
-      )
+      .upsert(upsertPayload, { onConflict: "user_id,provider,link_id" })
       .select("id")
       .returns<RowId[]>();
 
@@ -299,12 +302,13 @@ Deno.serve(async (req: Request) => {
         ? upData[0].id
         : null;
 
-    // Fallback select if upsert+select didn’t return the row (e.g., strict .single() issues or RLS edge cases)
+    // Fallback select if upsert+select didn’t return the row (RLS can sometimes block returning)
     if (!connectedBankId) {
       const { data: found, error: selErr } = await supa
         .from("connected_banks")
         .select("id")
         .eq("user_id", userId)
+        .eq("provider", "gocardless")
         .eq("link_id", requisitionId)
         .maybeSingle<RowId>();
 
@@ -314,7 +318,6 @@ Deno.serve(async (req: Request) => {
           JSON.stringify({
             correlationId,
             message: selErr.message,
-            // Narrowing to a minimal shape; keeps TS strict without unexpected any
             code: (selErr as { code?: string } | null)?.code,
             details: (selErr as { details?: unknown } | null)?.details,
             hint: (selErr as { hint?: string } | null)?.hint,

@@ -8,20 +8,20 @@ import { useCurrency } from "@/contexts/CurrencyContext";
 
 type TxRow = {
   id: string;
-  date: string;                 // date in DB; Supabase returns ISO-like string
+  date: string;                      // ISO-ish string from PostgREST
   description: string | null;
-  amount: string | number;      // numeric may come back as string
+  amount: number | string;           // numeric columns can arrive as string
   category: string;
   bank_account_id: string;
+  merchant_name: string | null;
+  bank_accounts: { name: string | null } | null; // embedded relation
 };
-
-type AccountRow = { id: string; name: string | null };
 
 type UiTx = {
   id: string;
-  date: string;                 // ISO string
+  date: string;                      // ISO (safe for Date)
   description: string;
-  amount: number;               // normalized to number for display
+  amount: number;
   bank_account_id: string;
   account_name: string | null;
   category: string;
@@ -32,21 +32,21 @@ export function TransactionList() {
   const { formatAmount } = useCurrency();
 
   const [transactions, setTransactions] = useState<UiTx[]>([]);
-  const [accountsById, setAccountsById] = useState<Map<string, string | null>>(new Map());
   const [hasAnyBank, setHasAnyBank] = useState<boolean>(false);
   const [loading, setLoading] = useState(true);
 
   const load = useCallback(async () => {
+    // If user not ready, show empty state without throwing type errors
     if (!user) {
       setTransactions([]);
-      setAccountsById(new Map());
       setHasAnyBank(false);
       setLoading(false);
       return;
     }
+
     setLoading(true);
 
-    // 1) Has any bank?
+    // 1) Do we have at least one connected bank? (for empty-state message)
     const { data: banks } = await supabase
       .from("connected_banks")
       .select("id")
@@ -55,10 +55,12 @@ export function TransactionList() {
 
     setHasAnyBank((banks?.length ?? 0) > 0);
 
-    // 2) Transactions
+    // 2) Fetch transactions and embed the account name — no accMap needed
     const { data: txData, error: txError } = await supabase
       .from("transactions")
-      .select("id, date, description, amount, category, bank_account_id")
+      .select(
+        "id, date, description, amount, category, bank_account_id, merchant_name, bank_accounts(name)"
+      )
       .eq("user_id", user.id)
       .order("date", { ascending: false })
       .returns<TxRow[]>();
@@ -66,48 +68,42 @@ export function TransactionList() {
     if (txError || !txData) {
       if (txError) console.error("Failed to load transactions", txError);
       setTransactions([]);
-      setAccountsById(new Map());
       setLoading(false);
       return;
     }
 
-    // 3) Account names
-    const accountIds = Array.from(new Set(txData.map((tx) => tx.bank_account_id)));
-    let accMap = new Map<string, string | null>();
-    if (accountIds.length > 0) {
-      const { data: accounts, error: accErr } = await supabase
-        .from("bank_accounts")
-        .select("id, name")
-        .in("id", accountIds)
-        .returns<AccountRow[]>();
-      if (accErr) console.error("Failed to load accounts", accErr);
-      accMap = new Map((accounts ?? []).map((a) => [a.id, a.name]));
-    }
-
-    // 4) Map to UI
+    // 3) Map DB rows → UI rows
     const ui: UiTx[] = txData.map((tx) => {
-      const amt = typeof tx.amount === "number" ? tx.amount : Number(tx.amount ?? 0);
+      const amt =
+        typeof tx.amount === "number" ? tx.amount : Number.parseFloat(String(tx.amount ?? 0));
+
       return {
         id: tx.id,
         date: tx.date ? new Date(tx.date).toISOString() : new Date().toISOString(),
-        description: (tx.description ?? "").trim() || "Transaction",
+        description: (tx.merchant_name ?? tx.description ?? "").trim() || "Transaction",
         amount: Number.isFinite(amt) ? amt : 0,
         bank_account_id: tx.bank_account_id,
-        account_name: accMap.get(tx.bank_account_id) ?? null,
-        category: (tx.category ?? "").trim() || "Other",
+        account_name: tx.bank_accounts?.name ?? null,
+        category: (tx.category ?? "").trim() || "Uncategorized",
       };
     });
 
     setTransactions(ui);
-    setAccountsById(accMap);
     setLoading(false);
   }, [user]);
 
-  useEffect(() => { void load(); }, [load]);
-
-  // refetch when sync completes (ConnectedBanksCard dispatches peng:tx:updated)
+  // initial + on auth change
   useEffect(() => {
-    const handler = () => { void load(); };
+    // eslint-disable-next-line @typescript-eslint/no-floating-promises
+    load();
+  }, [load]);
+
+  // refetch when sync completes (your ConnectedBanksCard should dispatch this)
+  useEffect(() => {
+    const handler = () => {
+      // eslint-disable-next-line @typescript-eslint/no-floating-promises
+      load();
+    };
     window.addEventListener("peng:tx:updated", handler as EventListener);
     return () => window.removeEventListener("peng:tx:updated", handler as EventListener);
   }, [load]);
@@ -142,7 +138,7 @@ export function TransactionList() {
                 <span>{new Date(tx.date).toLocaleDateString()}</span>
                 <span>•</span>
                 <span className="truncate">{tx.account_name || "Account"}</span>
-                {tx.category && tx.category !== "Other" && (
+                {tx.category && tx.category !== "Uncategorized" && (
                   <>
                     <span>•</span>
                     <Badge variant="secondary" className="h-5 text-[10px]">

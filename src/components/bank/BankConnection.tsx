@@ -121,7 +121,7 @@ export function BankConnection({ mode = "compact" }: Props) {
       const redirectUrl = `${location.origin}/banks/callback`; // must be whitelisted in GoCardless/Nordigen
       const bank = banks.find((b) => b.id === selectedBank);
       const res = await supabase.functions.invoke<{ link?: string }>("gc_create_requisition", {
-        body: { institution_id: selectedBank, redirect_url: redirectUrl, bank_name: bank?.name ?? "Bank" },
+        body: { institution_id: selectedBank, redirect_url: redirectUrl, bank_name: bank?.name ?? "Bank", country, },
       });
       if (res.error) throw res.error;
       if (!res.data?.link) throw new Error("Did not receive GoCardless link.");
