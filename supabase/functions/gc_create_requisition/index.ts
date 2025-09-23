@@ -279,23 +279,22 @@ Deno.serve(async (req: Request) => {
     //  - account_id is NOT known yet; real account rows are created in gc_complete.
     //  - If your schema still requires NOT NULL account_id, either relax it (recommended) or
     //    set a placeholder here (e.g., requisitionId). Code below assumes account_id is nullable.
-    const upsertPayload = {
+   const upsertPayload = {
       user_id: userId,
-      provider: "gocardless",
-      link_id: requisitionId,  // conflict key member
-      status: "pending" as const,
       bank_name,
-      country,
+      account_id: requisitionId,     // temporary placeholder
       institution_id,
       is_active: true,
-      // account_id: requisitionId, // <- ONLY if your column is NOT NULL (otherwise leave commented)
+      provider: "gocardless",
+      link_id: requisitionId,        // unique key piece
+      country: "SE",
+      status: "pending",
     };
 
     const { data: upData, error: upErr } = await supa
-      .from("connected_banks")
-      .upsert(upsertPayload, { onConflict: "user_id,provider,link_id" })
-      .select("id")
-      .returns<RowId[]>();
+    .from("connected_banks")
+    .upsert(upsertPayload, { onConflict: "user_id,provider,link_id" }) // <-- matches the index
+    .select("id");
 
     let connectedBankId: string | null =
       Array.isArray(upData) && upData.length > 0 && typeof upData[0]?.id === "string"

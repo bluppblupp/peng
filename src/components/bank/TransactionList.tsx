@@ -8,18 +8,19 @@ import { useCurrency } from "@/contexts/CurrencyContext";
 
 type TxRow = {
   id: string;
-  date: string;                      // ISO-ish string from PostgREST
+  date: string | null;                    // date may be null from the API
   description: string | null;
-  amount: number | string;           // numeric columns can arrive as string
-  category: string;
+  amount: number | string | null;         // numeric can arrive as string
+  category: string | null;
   bank_account_id: string;
   merchant_name: string | null;
-  bank_accounts: { name: string | null } | null; // embedded relation
+  // Embed via FK alias to avoid ambiguity
+  bank_accounts: { name: string | null } | null;
 };
 
 type UiTx = {
   id: string;
-  date: string;                      // ISO (safe for Date)
+  date: string;                           // normalized ISO for Date()
   description: string;
   amount: number;
   bank_account_id: string;
@@ -36,7 +37,6 @@ export function TransactionList() {
   const [loading, setLoading] = useState(true);
 
   const load = useCallback(async () => {
-    // If user not ready, show empty state without throwing type errors
     if (!user) {
       setTransactions([]);
       setHasAnyBank(false);
@@ -55,14 +55,24 @@ export function TransactionList() {
 
     setHasAnyBank((banks?.length ?? 0) > 0);
 
-    // 2) Fetch transactions and embed the account name — no accMap needed
+    // 2) Fetch transactions + embed account name through the explicit FK
     const { data: txData, error: txError } = await supabase
       .from("transactions")
-      .select(
-        "id, date, description, amount, category, bank_account_id, merchant_name, bank_accounts(name)"
-      )
+      .select(`
+        id,
+        date,
+        description,
+        amount,
+        category,
+        bank_account_id,
+        merchant_name,
+        bank_accounts:bank_accounts!transactions_bank_account_fkey (
+          name
+        )
+      `)
       .eq("user_id", user.id)
       .order("date", { ascending: false })
+      .order("id", { ascending: false })       // stable tie-breaker
       .returns<TxRow[]>();
 
     if (txError || !txData) {
@@ -72,10 +82,13 @@ export function TransactionList() {
       return;
     }
 
-    // 3) Map DB rows → UI rows
+    // 3) Map DB rows → UI rows (safe parsing, good fallbacks)
     const ui: UiTx[] = txData.map((tx) => {
+      const rawAmt = tx.amount;
       const amt =
-        typeof tx.amount === "number" ? tx.amount : Number.parseFloat(String(tx.amount ?? 0));
+        typeof rawAmt === "number"
+          ? rawAmt
+          : Number.parseFloat(String(rawAmt ?? 0));
 
       return {
         id: tx.id,
@@ -98,12 +111,9 @@ export function TransactionList() {
     load();
   }, [load]);
 
-  // refetch when sync completes (your ConnectedBanksCard should dispatch this)
+  // refetch when sync completes (your ConnectedBanksCard dispatches this)
   useEffect(() => {
-    const handler = () => {
-      // eslint-disable-next-line @typescript-eslint/no-floating-promises
-      load();
-    };
+    const handler = () => { /* eslint-disable-next-line @typescript-eslint/no-floating-promises */ load(); };
     window.addEventListener("peng:tx:updated", handler as EventListener);
     return () => window.removeEventListener("peng:tx:updated", handler as EventListener);
   }, [load]);

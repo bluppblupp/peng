@@ -1,6 +1,6 @@
 // supabase/functions/gc_complete/index.ts
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
-import { createClient } from "npm:@supabase/supabase-js@2.39.0";
+import { createClient, type SupabaseClient } from "npm:@supabase/supabase-js@2.39.0";
 import {
   allow,
   bearerFrom,
@@ -13,123 +13,133 @@ import {
   getString,
 } from "../_shared/gc.ts";
 
-type CompleteBody = { requisition_id?: string; reference?: string };
-
-type GcRequisition = {
-  id?: string;
-  reference?: string;
-  status?: string;
-  accounts?: unknown;
+/** Env we read from Deno.env */
+type Env = {
+  GOCARDLESS_BASE_URL: string;
+  GOCARDLESS_SECRET_ID: string;
+  GOCARDLESS_SECRET_KEY: string;
+  SUPABASE_URL: string;
+  SUPABASE_ANON_KEY: string;
+  TIMEOUT_REQUISITION_MS: number;
+  TIMEOUT_ACCT_MS: number;
 };
 
-type GcAccountMeta = {
-  account?: unknown;
-  iban?: unknown;
-  resourceId?: unknown;
-  currency?: unknown;
-  name?: unknown;
-  product?: unknown;
+type CompleteBody = {
+  /** GoCardless requisition id (we stored as connected_banks.link_id) */
+  requisition_id?: string;
 };
 
-type BankAccountInsert = {
-  user_id: string;
-  connected_bank_id: string;
-  provider: "gocardless";
-  institution_id: string;
-  account_id: string;
-  name: string | null;
-  iban: string | null;
-  currency: string | null;
-  type: string | null;
-};
+type RowId = { id: string };
 
-type UpsertIdRow = { id: string };
+/* ---------- small helpers (no side effects, no any) ---------- */
 
-function safeStr(v: unknown): string | null {
-  return typeof v === "string" && v.trim() ? v.trim() : null;
+function jsonHeaders(req: Request): HeadersInit {
+  return { "content-type": "application/json", ...allow(req) };
 }
 
-async function fetchRequisitionRobust(
-  env: { GOCARDLESS_BASE_URL: string },
+/** Cheap last4 for PAN/IBAN (safe if shorter) */
+function last4(s: string | null): string | null {
+  if (!s) return null;
+  const m = s.match(/(\d{4})$/);
+  return m ? m[1] : s.slice(-4);
+}
+
+/** Normalize account type: credit_card | deposit | other */
+function normalizeTypeFromMeta(
+  meta: Record<string, unknown>,
+  details: Record<string, unknown>
+): "credit_card" | "deposit" | "other" {
+  const product =
+    (getString(details, "product") ?? getString(meta, "product") ?? "").toLowerCase();
+  const cashType =
+    (getString(details, "cashAccountType") ?? getString(meta, "cashAccountType") ?? "").toLowerCase();
+  const maskedPan = getString(details, "maskedPan") ?? getString(meta, "maskedPan");
+
+  const looksCard = product.includes("credit") || cashType.includes("card") || !!maskedPan;
+  if (looksCard) return "credit_card";
+  if (cashType.includes("loan")) return "other";
+  return "deposit";
+}
+
+/** Build a human-friendly default name without overwriting user renames later */
+function buildNiceAccountName(
+  institutionName: string,
+  providerAccountId: string,
+  meta: Record<string, unknown>,
+  details: Record<string, unknown>
+): string {
+  const bank = (institutionName || "Bank").trim();
+  const display = getString(details, "name") ?? getString(meta, "display_name");
+  const product = getString(details, "product") ?? getString(meta, "product");
+  const maskedPan = getString(details, "maskedPan");
+  const iban = getString(details, "iban");
+  const tail = (maskedPan ?? iban ?? providerAccountId).slice(-4);
+
+  if (display && display.trim()) return display.trim();
+  if (product && product.trim()) return `${bank} · ${product.trim()} •••• ${tail}`;
+  return `${bank} •••• ${tail}`;
+}
+
+/** Fetch account meta with one soft retry for transient errors */
+async function fetchAccountMetaSafe(
+  env: Env,
   tokenHolder: { token: string },
+  providerAccountId: string,
   correlationId: string,
-  timeoutMs: number,
-  refresh: (cid: string) => Promise<string>,
-  requisitionId?: string | null,
-  reference?: string | null
-): Promise<GcRequisition | null> {
-  // 1) Try by id
-  if (requisitionId) {
-    const res = await gcFetchRaw(
-      env, tokenHolder,
-      `requisitions/${encodeURIComponent(requisitionId)}/`,
+  refresh: (cid: string) => Promise<string>
+): Promise<Response | null> {
+  const doOnce = async () =>
+    gcFetchRaw(
+      env,
+      tokenHolder,
+      `accounts/${encodeURIComponent(providerAccountId)}/`,
       { method: "GET" },
-      correlationId, timeoutMs, refresh
+      correlationId,
+      env.TIMEOUT_ACCT_MS,
+      refresh
     );
-    if (res.ok) return (await res.json().catch(() => ({}))) as GcRequisition;
 
-    if (res.status !== 404) {
-      const t = await res.text().catch(() => "");
-      throw new Response(
-        JSON.stringify({
-          error: "Bad Gateway",
-          code: "UPSTREAM_REQUISITION_ERROR",
-          correlationId,
-          details: { status: res.status, bodySnippet: t.slice(0, 900) },
-        }),
-        { status: 502, headers: { "content-type": "application/json" } }
-      );
+  try {
+    let res = await doOnce();
+    if (res.ok) return res;
+
+    // Retry for transient categories
+    if (res.status >= 500 || res.status === 429 || res.status === 408) {
+      res = await doOnce();
+      if (res.ok) return res;
     }
-    // fall through on 404
-  }
-
-  // 2) Try by listing and matching reference
-  if (reference) {
-    const list = await gcFetchRaw(
-      env, tokenHolder,
-      "requisitions/",
-      { method: "GET" },
-      correlationId, timeoutMs, refresh
+    return res; // non-ok is returned for caller to handle
+  } catch (e: unknown) {
+    console.error(
+      "gc_complete meta fetch threw",
+      JSON.stringify({ correlationId, message: errMessage(e) })
     );
-    if (!list.ok) {
-      const t = await list.text().catch(() => "");
-      throw new Response(
-        JSON.stringify({
-          error: "Bad Gateway",
-          code: "UPSTREAM_REQUISITION_LIST_ERROR",
-          correlationId,
-          details: { status: list.status, bodySnippet: t.slice(0, 900) },
-        }),
-        { status: 502, headers: { "content-type": "application/json" } }
-      );
-    }
-    const json = (await list.json().catch(() => ({}))) as { results?: GcRequisition[] };
-    const match = Array.isArray(json?.results)
-      ? json.results!.find(r => (r.reference || "").trim() === reference.trim())
-      : undefined;
-    if (match) return match;
+    return null;
   }
-
-  return null;
 }
+
+/* -------------------------- main handler -------------------------- */
 
 Deno.serve(async (req) => {
-  const correlationId = crypto.randomUUID();
-
   if (req.method === "OPTIONS") return new Response("ok", { headers: allow(req) });
+  const correlationId = crypto.randomUUID();
 
   try {
     if (req.method !== "POST") {
       return new Response(
         JSON.stringify({ error: "Method Not Allowed", code: "METHOD_NOT_ALLOWED", correlationId }),
-        { status: 405, headers: { "content-type": "application/json", ...allow(req) } },
+        { status: 405, headers: jsonHeaders(req) }
       );
     }
 
-    // ---- Env
+    // Env
     const rawEnv = Deno.env.toObject();
     let baseOk = true;
-    try { new URL(rawEnv.GOCARDLESS_BASE_URL || ""); } catch { baseOk = false; }
+    try {
+      new URL(rawEnv.GOCARDLESS_BASE_URL || "");
+    } catch {
+      baseOk = false;
+    }
     if (
       !baseOk ||
       !rawEnv.GOCARDLESS_SECRET_ID ||
@@ -139,266 +149,249 @@ Deno.serve(async (req) => {
     ) {
       return new Response(
         JSON.stringify({ error: "Internal Server Error", code: "CONFIG_MISSING", correlationId }),
-        { status: 500, headers: { "content-type": "application/json", ...allow(req) } },
+        { status: 500, headers: jsonHeaders(req) }
       );
     }
 
-    const env = {
+    const env: Env = {
       GOCARDLESS_BASE_URL: normalizeBase(rawEnv.GOCARDLESS_BASE_URL!),
       GOCARDLESS_SECRET_ID: rawEnv.GOCARDLESS_SECRET_ID!,
       GOCARDLESS_SECRET_KEY: rawEnv.GOCARDLESS_SECRET_KEY!,
       SUPABASE_URL: rawEnv.SUPABASE_URL!,
       SUPABASE_ANON_KEY: rawEnv.SUPABASE_ANON_KEY!,
       TIMEOUT_REQUISITION_MS: nint(rawEnv.GC_TIMEOUT_REQUISITION_MS, 20_000),
-      TIMEOUT_ACCOUNT_MS: nint(rawEnv.GC_TIMEOUT_ACCOUNT_MS, 10_000),
+      TIMEOUT_ACCT_MS: nint(rawEnv.GC_TIMEOUT_ACCT_MS, 15_000),
     };
 
-    // ---- Auth (caller’s JWT so RLS applies)
-    const token = bearerFrom(req);
-    const supa = createClient(env.SUPABASE_URL, env.SUPABASE_ANON_KEY, {
-      global: { headers: { Authorization: token ? `Bearer ${token}` : "" } },
+    // Auth
+    const jwt = bearerFrom(req);
+    const supa: SupabaseClient = createClient(env.SUPABASE_URL, env.SUPABASE_ANON_KEY, {
+      global: { headers: { Authorization: jwt ? `Bearer ${jwt}` : "" } },
       auth: { persistSession: false },
     });
-    const { data: { user }, error: authError } = await supa.auth.getUser(token);
-    if (authError || !user) {
+
+    const { data: userWrap, error: userErr } = await supa.auth.getUser(jwt);
+    if (userErr || !userWrap?.user) {
       return new Response(
         JSON.stringify({ error: "Unauthorized", code: "AUTH_REQUIRED", correlationId }),
-        { status: 401, headers: { "content-type": "application/json", ...allow(req) } },
+        { status: 401, headers: jsonHeaders(req) }
       );
     }
+    const userId = userWrap.user.id;
 
-    // ---- Body
+    // Body
     const raw = await req.text();
     let body: CompleteBody | null = null;
-    try { body = raw ? (JSON.parse(raw) as CompleteBody) : null; } catch {
+    try {
+      body = raw ? (JSON.parse(raw) as CompleteBody) : null;
+    } catch {
       return new Response(
         JSON.stringify({ error: "Bad Request", code: "INVALID_JSON", correlationId }),
-        { status: 400, headers: { "content-type": "application/json", ...allow(req) } },
+        { status: 400, headers: jsonHeaders(req) }
       );
     }
-    const requestedId = (body?.requisition_id || "").trim() || null;
-    const requestedRef = (body?.reference || "").trim() || null;
-    if (!requestedId && !requestedRef) {
+    const requisitionId = (body?.requisition_id || "").trim();
+    if (!requisitionId) {
       return new Response(
         JSON.stringify({ error: "Bad Request", code: "MISSING_FIELDS", correlationId }),
-        { status: 400, headers: { "content-type": "application/json", ...allow(req) } },
+        { status: 400, headers: jsonHeaders(req) }
       );
     }
 
-    // ---- BAD token
+    // connected_banks row for this requisition
+    const { data: cbRow, error: cbErr } = await supa
+      .from("connected_banks")
+      .select("id, user_id, provider, link_id, institution_id, bank_name")
+      .eq("user_id", userId)
+      .eq("provider", "gocardless")
+      .eq("link_id", requisitionId)
+      .maybeSingle<{ id: string; user_id: string; provider: string; link_id: string; institution_id: string; bank_name: string | null }>();
+
+    if (cbErr || !cbRow) {
+      return new Response(
+        JSON.stringify({ error: "Not Found", code: "CONNECTED_BANK_NOT_FOUND", correlationId }),
+        { status: 404, headers: jsonHeaders(req) }
+      );
+    }
+
+    // Upstream token
     const tokenHolder = { token: await newGcToken(env, correlationId) };
     const refresh = (cid: string) => newGcToken(env, cid);
 
-    // ---- Fetch requisition (robust: id then list-by-reference)
-    const requisition = await fetchRequisitionRobust(
+    // Requisition details -> accounts[]
+    const rqRes = await gcFetchRaw(
       env,
       tokenHolder,
+      `requisitions/${encodeURIComponent(requisitionId)}/`,
+      { method: "GET" },
       correlationId,
-      env.TIMEOUT_REQUISITION_MS!,
-      refresh,
-      requestedId,
-      requestedRef
+      env.TIMEOUT_REQUISITION_MS,
+      refresh
     );
-
-    if (!requisition?.id) {
+    if (!rqRes.ok) {
+      const t = await rqRes.text().catch(() => "");
+      console.error(
+        "gc_complete requisition fetch failed",
+        JSON.stringify({ correlationId, status: rqRes.status, bodySnippet: t.slice(0, 400) })
+      );
       return new Response(
         JSON.stringify({
-          error: "Not Found",
-          code: "REQUISITION_NOT_FOUND",
+          error: "Bad Gateway",
+          code: "UPSTREAM_REQUISITION_ERROR",
           correlationId,
-          details: { requestedId, requestedRef },
+          details: { status: rqRes.status },
         }),
-        { status: 404, headers: { "content-type": "application/json", ...allow(req) } },
+        { status: 502, headers: jsonHeaders(req) }
       );
     }
 
-    const reqId = requisition.id;
-
-    // Extract upstream account ids from requisition
-    const accountsVal = isRecord(requisition) ? (requisition as Record<string, unknown>).accounts : null;
-    const accountIds = Array.isArray(accountsVal)
-      ? (accountsVal as unknown[]).map((v) => (typeof v === "string" ? v : null)).filter((v): v is string => v !== null)
+    const rqJson = (await rqRes.json().catch(() => ({}))) as Record<string, unknown>;
+    const accounts = Array.isArray(rqJson.accounts)
+      ? (rqJson.accounts as unknown[]).map((x) => String(x || "")).filter(Boolean)
       : [];
 
-    // ---- Lookup connected_banks by link_id (reqId first, then reference)
-    let connectedBankId: string | null = null;
-    let institutionId: string | null = null;
-
-    {
-      const tryKeys: string[] = [reqId, requestedRef ?? ""].filter((k) => k.length > 0);
-      for (const key of tryKeys) {
-        const { data, error } = await supa
-          .from("connected_banks")
-          .select("id, institution_id")
-          .eq("user_id", user.id)
-          .eq("link_id", key)
-          .limit(1)
-          .maybeSingle();
-
-        if (!error && data?.id) {
-          connectedBankId = data.id;
-          institutionId = data.institution_id;
-          break;
-        }
-      }
-    }
-
-    if (!connectedBankId) {
-      // Create a stub if the create step didn't persist (shouldn’t usually happen)
-      const insertRes = await supa
+    if (accounts.length === 0) {
+      // Nothing yet (user may not have finished). Keep connection pending so UI can retry.
+      await supa
         .from("connected_banks")
-        .insert({
-          user_id: user.id,
-          bank_name: "Bank",
-          account_id: reqId,
-          institution_id: "unknown",
-          is_active: true,
-          provider: "gocardless",
-          link_id: reqId,
-          country: "SE",
-          status: "pending",
-        })
-        .select("id, institution_id")
-        .single();
+        .update({ status: "pending", last_sync_note: "No accounts yet" })
+        .eq("id", cbRow.id)
+        .eq("user_id", userId);
 
-      if (insertRes.error || !insertRes.data?.id) {
-        return new Response(
-          JSON.stringify({
-            error: "Database Error",
-            code: "DB_STUB_FAILED",
-            correlationId,
-            details: { message: insertRes.error?.message || "failed to create connected_banks stub" },
-          }),
-          { status: 500, headers: { "content-type": "application/json", ...allow(req) } },
-        );
-      }
-      connectedBankId = insertRes.data.id;
-      institutionId = insertRes.data.institution_id;
+      return new Response(
+        JSON.stringify({ ok: true, accounts: [], connected_bank_id: cbRow.id, correlationId }),
+        { status: 200, headers: jsonHeaders(req) }
+      );
     }
 
-    // ---- Fetch each account meta and upsert bank_accounts
-    const inserts: BankAccountInsert[] = [];
-    for (const accId of accountIds) {
-      const metaRes = await gcFetchRaw(
-        env,
-        tokenHolder,
-        `accounts/${encodeURIComponent(accId)}/`,
-        { method: "GET" },
-        correlationId,
-        env.TIMEOUT_ACCOUNT_MS!,
-        refresh
-      );
+    // For each upstream account: fetch meta, compute name/type, upsert bank_accounts
+    const createdIds: string[] = [];
+    let firstProviderAccountId = "";
+
+    for (const providerAccountId of accounts) {
+      if (!firstProviderAccountId) firstProviderAccountId = providerAccountId;
+
+      const metaRes = await fetchAccountMetaSafe(env, tokenHolder, providerAccountId, correlationId, refresh);
+      if (!metaRes) {
+        console.error(
+          "gc_complete meta fetch failed (threw)",
+          JSON.stringify({ correlationId, providerAccountId })
+        );
+        continue;
+      }
       if (!metaRes.ok) {
         const t = await metaRes.text().catch(() => "");
-        return new Response(
+        console.error(
+          "gc_complete meta non-ok",
           JSON.stringify({
-            error: "Bad Gateway",
-            code: "UPSTREAM_ACCOUNT_ERROR",
             correlationId,
-            details: { status: metaRes.status, bodySnippet: t.slice(0, 900) },
-          }),
-          { status: 502, headers: { "content-type": "application/json", ...allow(req) } },
+            providerAccountId,
+            status: metaRes.status,
+            bodySnippet: t.slice(0, 300),
+          })
         );
+        continue; // skip this account only
       }
 
-      const meta = (await metaRes.json().catch(() => ({}))) as GcAccountMeta;
-      const acctObj = isRecord(meta.account) ? (meta.account as Record<string, unknown>) : {};
-      const metaObj = isRecord(meta) ? (meta as Record<string, unknown>) : {};
+      const metaObj = (await metaRes.json().catch(() => ({}))) as Record<string, unknown>;
+      const details = isRecord(metaObj.account) ? (metaObj.account as Record<string, unknown>) : {};
 
-      const name =
-        getString(acctObj, "name") ??
-        getString(metaObj, "name") ??
-        "Account";
+      const nameComputed = buildNiceAccountName(
+        cbRow.bank_name ?? "Bank",
+        providerAccountId,
+        metaObj,
+        details
+      );
+      const iban = getString(details, "iban") ?? null;
+      const currency = getString(details, "currency") ?? getString(metaObj, "currency") ?? null;
+      const typeNorm = normalizeTypeFromMeta(metaObj, details);
 
-      const currency =
-        getString(acctObj, "currency") ??
-        getString(metaObj, "currency") ??
-        null;
+      // Read existing to avoid clobbering a user rename; only backfill type if missing
+      type ExistingBA = { id: string; name: string | null; type: string | null };
+      const { data: existing } = await supa
+        .from("bank_accounts")
+        .select("id, name, type")
+        .eq("user_id", userId)
+        .eq("provider", "gocardless")
+        .eq("account_id", providerAccountId)
+        .maybeSingle<ExistingBA>();
 
-      const iban =
-        getString(acctObj, "iban") ??
-        getString(metaObj, "iban") ??
-        null;
-
-      const type =
-        getString(acctObj, "product") ??
-        getString(metaObj, "product") ??
-        null;
-
-      inserts.push({
-        user_id: user.id,
-        connected_bank_id: connectedBankId!,
+      // Payload: set name only on first insert; type only if not present
+      const payload: {
+        user_id: string;
+        connected_bank_id: string;
+        provider: "gocardless";
+        institution_id: string;
+        account_id: string;
+        name?: string;
+        iban?: string | null;
+        currency?: string | null;
+        type?: string;
+        is_active: boolean;
+        is_selected?: boolean;
+      } = {
+        user_id: userId,
+        connected_bank_id: cbRow.id,
         provider: "gocardless",
-        institution_id: institutionId || "unknown",
-        account_id: accId,
-        name,
+        institution_id: cbRow.institution_id,
+        account_id: providerAccountId,
         iban,
         currency,
-        type,
-      });
-    }
+        is_active: true,
+      };
 
-    let accountRowIds: string[] = [];
-    if (inserts.length > 0) {
-      // De-dupe by (user_id, provider, institution_id, account_id)
-      const uniq = new Map<string, BankAccountInsert>();
-      for (const r of inserts) {
-        const k = `${r.user_id}|${r.provider}|${r.institution_id}|${r.account_id}`;
-        if (!uniq.has(k)) uniq.set(k, r);
+      if (!existing?.id) {
+        payload.name = nameComputed;
+        // Preselect the very first created account to improve UX
+        if (createdIds.length === 0) payload.is_selected = true;
       }
-      const deduped = Array.from(uniq.values());
+      if (!existing?.type) {
+        payload.type = typeNorm;
+      }
 
-      const { data, error } = await supa
+      const { data: upData, error: upErr } = await supa
         .from("bank_accounts")
-        .upsert(deduped as BankAccountInsert[], {
-          onConflict: "user_id,provider,institution_id,account_id",
-        })
+        .upsert(payload, { onConflict: "user_id,provider,account_id" })
         .select("id")
-        .returns<UpsertIdRow[]>();
+        .returns<RowId[]>();
 
-      if (error) {
-        return new Response(
-          JSON.stringify({
-            error: "Database Error",
-            code: "DB_UPSERT_FAILED",
-            correlationId,
-            details: {
-              message: error.message,
-              code: error.code,
-              details: error.details,
-              hint: error.hint,
-            },
-          }),
-          { status: 500, headers: { "content-type": "application/json", ...allow(req) } },
-        );
+      if (upErr || !upData || upData.length === 0) {
+        // Try to find existing row in case of unique/RLS races
+        const { data: found } = await supa
+          .from("bank_accounts")
+          .select("id")
+          .eq("user_id", userId)
+          .eq("provider", "gocardless")
+          .eq("account_id", providerAccountId)
+          .maybeSingle<RowId>();
+        if (found?.id) createdIds.push(found.id);
+      } else {
+        createdIds.push(upData[0].id);
       }
-      accountRowIds = Array.isArray(data) ? data.map((r) => r.id) : [];
     }
 
-    // ---- Mark bank active
+    // Activate the connection even if some accounts failed; surface that via last_error
     await supa
       .from("connected_banks")
-      .update({ status: "active", is_active: true })
-      .eq("id", connectedBankId!)
-      .eq("user_id", user.id);
+      .update({
+        status: "active",
+        account_id: firstProviderAccountId || null,
+        last_error: createdIds.length === 0 ? "No accounts could be saved" : null,
+      })
+      .eq("id", cbRow.id)
+      .eq("user_id", userId);
 
-    // ---- Response (callback expects accounts w/ row_id)
     return new Response(
       JSON.stringify({
         ok: true,
-        requisition_id: reqId,
-        accounts: accountRowIds.map((row_id, i) => ({
-          id: accountIds[i] ?? "",
-          row_id,
-          name: inserts[i]?.name ?? "Account",
-          currency: inserts[i]?.currency ?? null,
-          iban: inserts[i]?.iban ?? null,
-          type: inserts[i]?.type ?? null,
-        })),
+        connected_bank_id: cbRow.id,
+        bank_account_ids: createdIds,
+        correlationId,
       }),
-      { status: 200, headers: { "content-type": "application/json", ...allow(req) } },
+      { status: 200, headers: jsonHeaders(req) }
     );
   } catch (e: unknown) {
+    console.error("gc_complete unhandled", JSON.stringify({ correlationId, message: errMessage(e) }));
     return new Response(
       JSON.stringify({
         error: "Internal Server Error",
@@ -406,7 +399,7 @@ Deno.serve(async (req) => {
         correlationId,
         details: { message: errMessage(e) },
       }),
-      { status: 500, headers: { "content-type": "application/json", ...allow(req) } },
+      { status: 500, headers: jsonHeaders(req) }
     );
   }
 });

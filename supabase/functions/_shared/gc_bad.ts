@@ -2,7 +2,7 @@
 import { getNumber, getString, isRecord } from "./gc.ts";
 
 /** Upstream BAD (Bank Account Data) shapes we touch */
-export type BadTx = {
+export type BankAccountDataTx = {
   transactionId?: unknown;
   internalTransactionId?: unknown;
   entryReference?: unknown;
@@ -23,7 +23,7 @@ export type BadTx = {
   additionalInformation?: unknown; // string-ish in some banks
 };
 
-export type BadTxPage = {
+export type BankAccountDataTxPage = {
   transactions?: { booked?: unknown; pending?: unknown };
   next?: unknown;
 };
@@ -49,14 +49,14 @@ function firstStr(...cands: Array<unknown>): string | null {
 }
 
 /** Prefer bookingDate, else valueDate, else today */
-function pickDate(tx: BadTx): string {
+function pickDate(tx: BankAccountDataTx): string {
   const d = firstStr(tx.bookingDate, tx.valueDate);
   if (d) return d.slice(0, 10);
   return new Date().toISOString().slice(0, 10);
 }
 
 /** Try to extract merchant-ish description */
-function pickRawDescription(tx: BadTx): string {
+function pickRawDescription(tx: BankAccountDataTx): string {
   // Card sub-object merchant name (if present)
   const cardObj = isRecord(tx.cardTransaction) ? tx.cardTransaction : null;
   const cardMerchant = cardObj ? getString(cardObj, "merchantName") : null;
@@ -101,7 +101,7 @@ async function sha256Hex(s: string): Promise<string> {
 
 /** Normalize one upstream transaction into our working shape (pre sign-fix) */
 export async function toNormalizedTx(
-  tx: BadTx,
+  tx: BankAccountDataTx,
   providerAccountId: string
 ): Promise<NormalizedTx> {
   const txId  = typeof tx.transactionId === "string" ? tx.transactionId : null;
